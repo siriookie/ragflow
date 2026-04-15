@@ -203,6 +203,8 @@ class Dealer:
 
     @staticmethod
     def trans2floats(txt):
+        # 把以制表符分隔的向量字符串转成 float 列表。
+        # 这样做是为了兼容底层向量字段有时以字符串形式存储、而后续相似度计算需要数值数组的情况。
         return [get_float(t) for t in txt.split("\t")]
 
     def insert_citations(self, answer, chunks, chunk_v,
@@ -298,52 +300,74 @@ class Dealer:
         return res, seted
 
     def _rank_feature_scores(self, query_rfea, search_res):
-        ## For rank feature(tag_fea) scores.
+        # 计算额外排序特征分数。
+        # 目前主要是两部分：
+        # 1. 文档自身的 PageRank
+        # 2. 查询侧 rank_feature 与 chunk 侧 TAG_FLD 的相似度
         rank_fea = []
         pageranks = []
+        # 先把每个 chunk 的 PageRank 取出来，作为基础先验分。
         for chunk_id in search_res.ids:
             pageranks.append(search_res.field[chunk_id].get(PAGERANK_FLD, 0))
         pageranks = np.array(pageranks, dtype=float)
 
+        # 如果查询侧没有额外 rank_feature，就只返回 pagerank。
         if not query_rfea:
             return np.array([0 for _ in range(len(search_res.ids))]) + pageranks
 
+        # 先算查询侧 rank_feature 向量的模长。
+        # 注意这里把 PageRank 从归一化计算里排除，因为它不是 tag 相似度的一部分，而是直接加成项。
         q_denor = np.sqrt(np.sum([s * s for t, s in query_rfea.items() if t != PAGERANK_FLD]))
         for i in search_res.ids:
             nor, denor = 0, 0
+            # 当前 chunk 没有标签特征时，额外特征相似度记为 0。
             if not search_res.field[i].get(TAG_FLD):
                 rank_fea.append(0)
                 continue
+            # 计算查询侧 rank_feature 与当前 chunk 标签特征的点积与模长。
             for t, sc in eval(search_res.field[i].get(TAG_FLD, "{}")).items():
                 if t in query_rfea:
                     nor += query_rfea[t] * sc
                 denor += sc * sc
+            # 当前 chunk 标签向量为空时，相似度记为 0。
             if denor == 0:
                 rank_fea.append(0)
             else:
+                # 这里本质上在算一个余弦相似度。
                 rank_fea.append(nor / np.sqrt(denor) / q_denor)
+        # 把标签特征分数放大后与 pagerank 相加，形成最终额外排序分。
         return np.array(rank_fea) * 10. + pageranks
 
     def rerank(self, sres, query, tkweight=0.3,
                vtweight=0.7, cfield="content_ltks",
                rank_feature: dict | None = None
                ):
+        # 从查询里提取关键词，供词法相似度计算使用。
         _, keywords = self.qryr.question(query)
+        # 根据查询向量维度推断 chunk 里的向量字段名。
         vector_size = len(sres.query_vector)
         vector_column = f"q_{vector_size}_vec"
         zero_vector = [0.0] * vector_size
+        # 收集每个 chunk 的向量表示。
         ins_embd = []
         for chunk_id in sres.ids:
             vector = sres.field[chunk_id].get(vector_column, zero_vector)
+            # 向量如果是字符串形式，先转成 float 数组。
             if isinstance(vector, str):
                 vector = [get_float(v) for v in vector.split("\t")]
             ins_embd.append(vector)
+        # 没有任何向量可用时，直接返回空分数。
         if not ins_embd:
             return [], [], []
 
+        # 统一把 `important_kwd` 规范成列表。
         for i in sres.ids:
             if isinstance(sres.field[i].get("important_kwd", []), str):
                 sres.field[i]["important_kwd"] = [sres.field[i]["important_kwd"]]
+        # 构造每个 chunk 的词法特征 token 列表。
+        # 这里对不同来源的 token 做了人工加权：
+        # title * 2, important_kwd * 5, question_tks * 6
+        # 目的是让更强语义信号在 token 相似度里占更大权重。
         ins_tw = []
         for i in sres.ids:
             content_ltks = list(OrderedDict.fromkeys(sres.field[i][cfield].split()))
@@ -353,24 +377,34 @@ class Dealer:
             tks = content_ltks + title_tks * 2 + important_kwd * 5 + question_tks * 6
             ins_tw.append(tks)
 
-        ## For rank feature(tag_fea) scores.
+        # 计算额外排序特征分数，例如标签特征和 pagerank。
         rank_fea = self._rank_feature_scores(rank_feature, sres)
 
+        # 同时计算：
+        # 1. 综合相似度 sim
+        # 2. 词法相似度 tksim
+        # 3. 向量相似度 vtsim
         sim, tksim, vtsim = self.qryr.hybrid_similarity(sres.query_vector,
                                                         ins_embd,
                                                         keywords,
                                                         ins_tw, tkweight, vtweight)
 
+        # 最终综合分 = 混合相似度 + 额外排序特征。
         return sim + rank_fea, tksim, vtsim
 
     def rerank_by_model(self, rerank_mdl, sres, query, tkweight=0.3,
                         vtweight=0.7, cfield="content_ltks",
                         rank_feature: dict | None = None):
+        # 先从查询里提取关键词，供词法相似度部分使用。
         _, keywords = self.qryr.question(query)
 
+        # 统一把 `important_kwd` 规范成列表，避免后面拼接 token 时出现字符串逐字符展开的问题。
         for i in sres.ids:
             if isinstance(sres.field[i].get("important_kwd", []), str):
                 sres.field[i]["important_kwd"] = [sres.field[i]["important_kwd"]]
+        # 构造每个 chunk 的 token 序列。
+        # 与 `rerank()` 不同，这里权重更轻，不做 title / important_kwd 的重复放大，
+        # 因为主要语义判断会交给独立 rerank 模型完成。
         ins_tw = []
         for i in sres.ids:
             content_ltks = sres.field[i][cfield].split()
@@ -379,14 +413,21 @@ class Dealer:
             tks = content_ltks + title_tks + important_kwd
             ins_tw.append(tks)
 
+        # 先计算一个轻量的词法相似度分数。
         tksim = self.qryr.token_similarity(keywords, ins_tw)
+        # 再调用独立 rerank 模型，基于 query 与 chunk 文本计算语义相似度。
+        # 这里把 token 列表重新拼成字符串，是因为大多数 rerank 模型吃的是纯文本输入。
         vtsim, _ = rerank_mdl.similarity(query, [remove_redundant_spaces(" ".join(tks)) for tks in ins_tw])
-        ## For rank feature(tag_fea) scores.
+        # 计算额外排序特征分数。
         rank_fea = self._rank_feature_scores(rank_feature, sres)
 
+        # 最终综合分 = 词法相似度 * tkweight + rerank 模型分 * vtweight + 额外排序特征。
+        # 这一步的作用是把“可解释的词法分”“更强的语义分”“先验特征分”融合成一个总分。
         return tkweight * np.array(tksim) + vtweight * vtsim + rank_fea, tksim, vtsim
 
     def hybrid_similarity(self, ans_embd, ins_embd, ans, inst):
+        # 这是一个对底层 `qryr.hybrid_similarity` 的薄封装。
+        # 作用是把原始文本先走 tokenizer，再统一交给 queryer 计算混合相似度。
         return self.qryr.hybrid_similarity(ans_embd,
                                            ins_embd,
                                            rag_tokenizer.tokenize(ans).split(),
