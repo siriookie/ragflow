@@ -50,13 +50,39 @@ class Dealer:
         group_docs: list[list] | None = None
 
     async def get_vector(self, txt, emb_mdl, topk=10, similarity=0.1):
+        # 通过共享线程池异步调用 embedding 模型。
+        # 这样做是因为大多数 embedding SDK 调用都是阻塞的，可能涉及 I/O
+        # 或较重的 CPU/GPU 计算；把它们丢到线程池里可以避免卡住事件循环。
         qv, _ = await thread_pool_exec(emb_mdl.encode_queries, txt)
+
+        # 先把 embedding 结果转成 numpy shape，用来校验返回结构。
+        # 因为下游文档存储层期望拿到的是“一个查询向量”，而不是一整个 batch。
         shape = np.array(qv).shape
+
+        # 显式拒绝多维输出。
+        # 如果模型这里返回的是 batch 形状的数组，后续代码就无法判断
+        # 到底应该拿一个向量去搜，还是拿多个向量去搜，生成的 MatchDenseExpr
+        # 也会变得含义不清甚至非法。
         if len(shape) > 1:
             raise Exception(
                 f"Dealer.get_vector returned array's shape {shape} doesn't match expectation(exact one dimension).")
+
+        # 把每个元素都规范成普通 float。
+        # 这样可以避免 numpy 标量、decimal，或者模型 SDK 自己的数值包装类型
+        # 混进文档存储适配层；下游更希望拿到一个干净的 Python float 列表。
         embedding_data = [get_float(v) for v in qv]
+
+        # 根据 embedding 维度推导向量字段名。
+        # RAGFlow 把不同维度的向量存进不同列里，比如 q_768_vec、q_1024_vec，
+        # 所以查询侧必须精确命中和模型输出维度一致的那一列。
         vector_column_name = f"q_{len(embedding_data)}_vec"
+
+        # 构造文档存储适配层要消费的稠密向量检索表达式
+        # （例如 ES、Infinity 等底层引擎都会读这个对象）。
+        # - 'float' 表示向量元素类型
+        # - 'cosine' 表示使用余弦相似度
+        # - topk 控制底层向量召回多少候选
+        # - similarity 作为底层阈值，用来过滤过弱的匹配
         return MatchDenseExpr(vector_column_name, embedding_data, 'float', 'cosine', topk, {"similarity": similarity})
 
     def get_filters(self, req):
@@ -703,67 +729,105 @@ class Dealer:
         return {a.replace(".", "_"): max(1, c) for a, c in tag_fea}
 
     async def retrieval_by_toc(self, query: str, chunks: list[dict], tenant_ids: list[str], chat_mdl, topn: int = 6):
+        # 延迟导入目录增强相关逻辑，避免模块加载阶段产生循环依赖。
         from rag.prompts.generator import relevant_chunks_with_toc # moved from the top of the file to avoid circular import
+        # 没有任何候选 chunk 时，目录增强没有对象可扩展，直接返回空。
         if not chunks:
             return []
+        # 把租户 ID 转成底层索引名，后面查目录 chunk 和补充正文 chunk 都要用到。
         idx_nms = [index_name(tid) for tid in tenant_ids]
+        # ranks 用来累计“每个文档当前命中 chunk 的总相似度”，
+        # doc_id2kb_id 用来记录文档属于哪个知识库，方便后面精确回查。
         ranks, doc_id2kb_id = {}, {}
         for ck in chunks:
+            # 初始化当前文档的累计得分。
             if ck["doc_id"] not in ranks:
                 ranks[ck["doc_id"]] = 0
+            # 把同一文档下多个命中 chunk 的相似度加总。
+            # 这样可以选出“当前最值得继续沿目录扩展”的主文档。
             ranks[ck["doc_id"]] += ck["similarity"]
+            # 记录 doc_id -> kb_id 的映射，后面查目录时要带上对应知识库过滤。
             doc_id2kb_id[ck["doc_id"]] = ck["kb_id"]
+        # 选出累计得分最高的那个文档，目录增强只在这个文档内部进行。
+        # 这样做是为了避免把目录扩展范围放得太宽，稀释当前最相关文档的上下文。
         doc_id = sorted(ranks.items(), key=lambda x: x[1] * -1.)[0][0]
+        # 当前主文档所在的知识库 ID。
         kb_ids = [doc_id2kb_id[doc_id]]
+        # 去索引里查这个文档对应的目录 chunk。
+        # 目录 chunk 通过 toc_kwd == "toc" 标识，核心内容放在 content_with_weight 里。
         es_res = self.dataStore.search(["content_with_weight"], [], {"doc_id": doc_id, "toc_kwd": "toc"}, [],
                                        OrderByExpr(), 0, 128, idx_nms,
                                        kb_ids)
+        # toc 用来汇总目录节点列表。
         toc = []
+        # 把搜索结果转成字段字典，便于逐条解析目录内容。
         dict_chunks = self.dataStore.get_fields(es_res, ["content_with_weight"])
         for _, doc in dict_chunks.items():
             try:
+                # 每个目录 chunk 的 content_with_weight 存的是 JSON 数组，
+                # 这里把它展开后合并成一份完整目录。
                 toc.extend(json.loads(doc["content_with_weight"]))
             except Exception as e:
+                # 目录 JSON 解析失败时只记日志，不让整个检索流程失败。
                 logging.exception(e)
+        # 当前文档没有可用目录时，目录增强无法继续，直接返回原始候选。
         if not toc:
             return chunks
 
+        # 让聊天模型根据“用户问题 + 目录结构”挑出最相关的目录项 / chunk id。
+        # 先取 topn * 2 个，是为了给后面的合并和去重预留余量。
         ids = await relevant_chunks_with_toc(query, toc, chat_mdl, topn * 2)
+        # 模型如果没有挑出任何目录命中项，就保留原始结果。
         if not ids:
             return chunks
 
+        # 默认向量维度兜底值；如果后面读到真实向量字段，会用真实维度覆盖。
         vector_size = 1024
+        # 先建立当前结果里已有 chunk 的索引表。
+        # 这样目录增强命中的 chunk 如果已经在候选里，只需要加分，不必重复插入。
         id2idx = {ck["chunk_id"]: i for i, ck in enumerate(chunks)}
         for cid, sim in ids:
+            # 如果目录增强命中的 chunk 原本就存在，就把目录相关性分直接加到原 similarity 上。
             if cid in id2idx:
                 chunks[id2idx[cid]]["similarity"] += sim
                 continue
+            # 否则去底层索引里把这个 chunk 取回来，补充进结果集。
             chunk = self.dataStore.get(cid, idx_nms[0], kb_ids)
+            # 目录里指到但索引里取不到的 chunk，直接跳过。
             if not chunk:
                 continue
+            # 组装成和普通 retrieval 返回结构一致的 chunk 字典，
+            # 这样后续排序和上层消费逻辑无需区分“原始召回”还是“目录补召回”。
             d = {
                 "chunk_id": cid,
                 "content_ltks": chunk["content_ltks"],
                 "content_with_weight": chunk["content_with_weight"],
+                # 目录增强只在当前主文档内部扩展，所以这里沿用选出的主 doc_id。
                 "doc_id": doc_id,
                 "docnm_kwd": chunk.get("docnm_kwd", ""),
                 "kb_id": chunk["kb_id"],
                 "important_kwd": chunk.get("important_kwd", []),
                 "image_id": chunk.get("img_id", ""),
+                # 目录增强给出的 sim 在这里同时作为综合分、词法分、向量分的占位值。
+                # 这样做主要是为了兼容统一结果结构，并不意味着这三种分真的分别算过。
                 "similarity": sim,
                 "vector_similarity": sim,
                 "term_similarity": sim,
+                # 先放零向量占位；如果真实 chunk 里存在 *_vec 字段，后面再替换成真实向量。
                 "vector": [0.0] * vector_size,
                 "positions": chunk.get("position_int", []),
                 "doc_type_kwd": chunk.get("doc_type_kwd", "")
             }
             for k in chunk.keys():
+                # 如果取到真实向量字段，就同步写回返回结构，并更新当前向量维度。
                 if k[-4:] == "_vec":
                     d["vector"] = chunk[k]
                     vector_size = len(chunk[k])
                     break
+            # 把目录增强补出的新 chunk 加入候选集合。
             chunks.append(d)
 
+        # 最后按更新后的 similarity 重新排序，并只保留 topn 条结果。
         return sorted(chunks, key=lambda x: x["similarity"] * -1)[:topn]
 
     def retrieval_by_children(self, chunks: list[dict], tenant_ids: list[str]):
