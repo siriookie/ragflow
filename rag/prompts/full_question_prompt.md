@@ -1,37 +1,37 @@
-## Role
-A helpful assistant.
+## 角色
+一个有帮助的助手。
 
-## Task & Steps
-1. Generate a full user question that would follow the conversation.
-2. If the user's question involves relative dates, convert them into absolute dates based on today ({{ today }}).
-   - "yesterday" = {{ yesterday }}, "tomorrow" = {{ tomorrow }}
+## 任务与步骤
+1. 根据下面的对话，补全用户接下来真正想问的完整问题。
+2. 如果用户的问题里包含相对日期，请基于今天（{{ today }}）将其改写为绝对日期。
+   - “昨天” = {{ yesterday }}，“明天” = {{ tomorrow }}
 
-## Requirements & Restrictions
-- If the user's latest question is already complete, don't do anything — just return the original question.
-- DON'T generate anything except a refined question.
+## 要求与限制
+- 如果用户最新的问题已经足够完整，就不要改写，直接返回原问题。
+- 除了改写后的问题本身，不要输出任何额外内容。
 {% if language %}
-- Text generated MUST be in {{ language }}.
+- 生成的文本必须使用 {{ language }}。
 {% else %}
-- Text generated MUST be in the same language as the original user's question.
+- 生成的文本必须与原始用户问题保持相同语言。
 {% endif %}
 
 ---
 
-## Examples
+## 示例
 
-### Example 1
-**Conversation:**
+### 示例 1
+**对话：**
 
 USER: What is the name of Donald Trump's father?
 ASSISTANT: Fred Trump.
 USER: And his mother?
 
-**Output:** What's the name of Donald Trump's mother?
+**输出：** What's the name of Donald Trump's mother?
 
 ---
 
-### Example 2
-**Conversation:**
+### 示例 2
+**对话：**
 
 USER: What is the name of Donald Trump's father?
 ASSISTANT: Fred Trump.
@@ -39,24 +39,23 @@ USER: And his mother?
 ASSISTANT: Mary Trump.
 USER: What's her full name?
 
-**Output:** What's the full name of Donald Trump's mother Mary Trump?
+**输出：** What's the full name of Donald Trump's mother Mary Trump?
 
 ---
 
-### Example 3
-**Conversation:**
+### 示例 3
+**对话：**
 
 USER: What's the weather today in London?
 ASSISTANT: Cloudy.
 USER: What's about tomorrow in Rochester?
 
-**Output:** What's the weather in Rochester on {{ tomorrow }}?
+**输出：** What's the weather in Rochester on {{ tomorrow }}?
 
 ---
 
-## Real Data
+## 实际数据
 
-**Conversation:**
+**对话：**
 
 {{ conversation }}
-

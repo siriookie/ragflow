@@ -227,27 +227,42 @@ async def question_proposal(chat_mdl, content, topn=3):
 
 
 async def full_question(tenant_id=None, llm_id=None, messages=[], language=None, chat_mdl=None):
+    # 延迟导入相关依赖。
+    # 这样做是为了避免模块加载时形成不必要的循环依赖，也让这个工具函数在被调用时才解析模型相关对象。
     from common.constants import LLMType
     from api.db.services.llm_service import LLMBundle
     from api.db.services.tenant_llm_service import TenantLLMService
     from api.db.joint_services.tenant_model_service import get_model_config_by_type_and_name
 
+    # 如果调用方没有直接传入可用的 chat_mdl，就在这里按 tenant 和 llm_id 临时构造一个。
+    # 这样做是为了让 `full_question` 既能复用外部已绑定模型，也能独立工作。
     if not chat_mdl:
+        # 图片理解模型和普通聊天模型的配置通道不同，这里要先按 llm 类型分流。
         if TenantLLMService.llm_id2llm_type(llm_id) == "image2text":
             chat_model_config = get_model_config_by_type_and_name(tenant_id, LLMType.IMAGE2TEXT, llm_id)
         else:
             chat_model_config = get_model_config_by_type_and_name(tenant_id, LLMType.CHAT, llm_id)
+        # 构造一个可直接调用的模型 bundle。
         chat_mdl = LLMBundle(tenant_id, chat_model_config)
+    # `conv` 用来收集会进入“问题补全”提示词的对话历史。
     conv = []
     for m in messages:
+        # 只保留 user / assistant 两类消息。
+        # 这样做是为了让问题改写只聚焦真正的对话内容，而不把 system 等控制消息混进去。
         if m["role"] not in ["user", "assistant"]:
             continue
+        # 把每条消息规范成 `ROLE: content` 的纯文本形式。
+        # 这样做是为了给 LLM 一个清晰、简单且厂商无关的多轮对话上下文。
         conv.append("{}: {}".format(m["role"].upper(), m["content"]))
+    # 把多轮消息拼成一段连续对话文本。
     conversation = "\n".join(conv)
+    # 生成今天、昨天、明天的绝对日期。
+    # 这样做是为了帮助模型把“今天/昨天/明天”这类相对时间补全成更明确的查询意图。
     today = datetime.date.today().isoformat()
     yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
     tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
 
+    # 用模板生成“把当前多轮对话补全成完整问题”的 system prompt。
     template = PROMPT_JINJA_ENV.from_string(FULL_QUESTION_PROMPT_TEMPLATE)
     rendered_prompt = template.render(
         today=today,
@@ -257,8 +272,13 @@ async def full_question(tenant_id=None, llm_id=None, messages=[], language=None,
         language=language,
     )
 
+    # 调用模型生成补全后的完整问题。
+    # 这里 user 输入固定为 `Output: `，意味着真正的任务说明都在 rendered_prompt 里。
     ans = await chat_mdl.async_chat(rendered_prompt, [{"role": "user", "content": "Output: "}])
+    # 去掉可能夹带的思考内容，只保留最终输出的问题文本。
     ans = re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
+    # 如果模型没有报错，就返回补全后的问题；否则回退到原始最后一条用户消息。
+    # 这样做是为了保证问题改写失败时不会阻断主检索链路。
     return ans if ans.find("**ERROR**") < 0 else messages[-1]["content"]
 
 

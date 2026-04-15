@@ -77,42 +77,58 @@ class Dealer:
                highlight: bool | list | None = None,
                rank_feature: dict | None = None
                ):
+        # 默认关闭高亮，除非调用方显式要求。
         if highlight is None:
             highlight = False
 
+        # 从请求里提取底层过滤条件，例如 kb_id、doc_id、available_int 等。
         filters = self.get_filters(req)
+        # 初始化排序表达式对象。
         orderBy = OrderByExpr()
 
+        # 解析分页参数。
+        # 这里是底层搜索分页，不一定等同于最终业务层返回页。
         pg = int(req.get("page", 1)) - 1
         topk = int(req.get("topk", 1024))
         ps = int(req.get("size", topk))
         offset, limit = pg * ps, ps
 
+        # 确定本次需要从底层取回哪些字段。
+        # 默认字段既包含展示用文本，也包含排序、引用、图谱、标签、向量等后续处理所需字段。
         src = req.get("fields",
                       ["docnm_kwd", "content_ltks", "kb_id", "img_id", "title_tks", "important_kwd", "position_int",
                        "doc_id", "chunk_order_int", "page_num_int", "top_int", "create_timestamp_flt", "knowledge_graph_kwd",
                        "question_kwd", "question_tks", "doc_type_kwd",
                        "available_int", "content_with_weight", "mom_id", PAGERANK_FLD, TAG_FLD, "row_id()"])
+        # `kwds` 用来收集问题关键词，后面生成高亮时会用到。
         kwds = set([])
 
+        # 读取问题文本。
         qst = req.get("question", "")
+        # `q_vec` 保存查询向量；只有使用 embedding 检索时才会填充。
         q_vec = []
+        # 没有问题文本时，退化成“带过滤条件的列表查询”。
         if not qst:
+            # 如果请求要求排序，就按 chunk 在文档中的自然顺序和创建时间排序。
             if req.get("sort"):
                 orderBy.asc("chunk_order_int")
                 orderBy.asc("page_num_int")
                 orderBy.asc("top_int")
                 orderBy.desc("create_timestamp_flt")
+            # 不做全文检索，只按过滤和排序直接查。
             res = self.dataStore.search(src, [], filters, [], orderBy, offset, limit, idx_names, kb_ids)
             total = self.dataStore.get_total(res)
             logging.debug("Dealer.search TOTAL: {}".format(total))
         else:
+            # 有问题文本时，先确定是否需要高亮字段。
             highlightFields = ["content_ltks", "title_tks"]
             if not highlight:
                 highlightFields = []
             elif isinstance(highlight, list):
                 highlightFields = highlight
+            # 把自然语言问题解析成全文检索表达式和关键词列表。
             matchText, keywords = self.qryr.question(qst, min_match=0.3)
+            # 如果没有 embedding 模型，就只能走纯文本检索。
             if emb_mdl is None:
                 matchExprs = [matchText]
                 res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
@@ -120,25 +136,33 @@ class Dealer:
                 total = self.dataStore.get_total(res)
                 logging.debug("Dealer.search TOTAL: {}".format(total))
             else:
+                # 有 embedding 模型时，额外构造查询向量表达式。
                 matchDense = await self.get_vector(qst, emb_mdl, topk, req.get("similarity", 0.1))
                 q_vec = matchDense.embedding_data
+                # 非 Infinity 引擎需要把向量字段显式取回，供后续重排和相似度计算使用。
                 if not settings.DOC_ENGINE_INFINITY:
                     src.append(f"q_{len(q_vec)}_vec")
 
+                # 构造文本检索 + 向量检索的融合表达式。
+                # 当前权重固定为 0.05 / 0.95，说明底层搜索阶段更偏向向量召回。
                 fusionExpr = FusionExpr("weighted_sum", topk, {"weights": "0.05,0.95"})
                 matchExprs = [matchText, matchDense, fusionExpr]
 
+                # 执行混合检索。
                 res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
                                             idx_names, kb_ids, rank_feature=rank_feature)
                 total = self.dataStore.get_total(res)
                 logging.debug("Dealer.search TOTAL: {}".format(total))
 
-                # If result is empty, try again with lower min_match
+                # 如果一次混合检索完全没有结果，就做一次更宽松的兜底重试。
                 if total == 0:
+                    # 如果已经限定了 doc_id，说明调用方只关心这些文档。
+                    # 这时直接按文档过滤查询，不再坚持文本/向量匹配。
                     if filters.get("doc_id"):
                         res = await thread_pool_exec(self.dataStore.search, src, [], filters, [], orderBy, offset, limit, idx_names, kb_ids)
                         total = self.dataStore.get_total(res)
                     else:
+                        # 否则降低全文匹配要求，并稍微放宽向量相似度阈值，再试一次。
                         matchText, _ = self.qryr.question(qst, min_match=0.1)
                         matchDense.extra_options["similarity"] = 0.17
                         res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, [matchText, matchDense, fusionExpr],
@@ -147,6 +171,7 @@ class Dealer:
                         total = self.dataStore.get_total(res)
                     logging.debug("Dealer.search 2 TOTAL: {}".format(total))
 
+            # 把主关键词和细粒度分词都收集起来，用于后续高亮和提示。
             for k in keywords:
                 kwds.add(k)
                 for kk in rag_tokenizer.fine_grained_tokenize(k).split():
@@ -157,10 +182,15 @@ class Dealer:
                     kwds.add(kk)
 
         logging.debug(f"TOTAL: {total}")
+        # 抽取命中的文档 ID 列表。
         ids = self.dataStore.get_doc_ids(res)
+        # 关键词集合转成列表，后续用于高亮处理。
         keywords = list(kwds)
+        # 生成高亮结果。
         highlight = self.dataStore.get_highlight(res, keywords, "content_with_weight")
+        # 提取按文档名聚合的底层聚合结果。
         aggs = self.dataStore.get_aggregation(res, "docnm_kwd")
+        # 统一封装搜索结果对象返回。
         return self.SearchResult(
             total=total,
             ids=ids,
@@ -379,13 +409,19 @@ class Dealer:
             highlight=False,
             rank_feature: dict | None = {PAGERANK_FLD: 10},
     ):
+        # 初始化统一返回结构。
+        # `chunks` 保存当前页真正返回的片段，`doc_aggs` 保存按文档聚合的命中统计。
         ranks = {"total": 0, "chunks": [], "doc_aggs": {}}
+        # 没有问题时直接返回空结果，避免无意义检索。
         if not question:
             return ranks
 
-        # Ensure RERANK_LIMIT is multiple of page_size
+        # 计算一次实际召回并参与重排的候选上限。
+        # 这里保证它是 `page_size` 的倍数，并至少为 30，这样分页后的重排结果更稳定。
         RERANK_LIMIT = math.ceil(64 / page_size) * page_size if page_size > 1 else 1
         RERANK_LIMIT = max(30, RERANK_LIMIT)
+        # 组装底层搜索请求。
+        # 注意这里的 `page/size` 不是最终返回页，而是“候选召回页”，后面还会在重排后再次分页。
         req = {
             "kb_ids": kb_ids,
             "doc_ids": doc_ids,
@@ -398,12 +434,16 @@ class Dealer:
             "available_int": 1,
         }
 
+        # 兼容 `tenant_ids` 既可能是字符串，也可能是列表的调用方式。
         if isinstance(tenant_ids, str):
             tenant_ids = tenant_ids.split(",")
 
+        # 先做一次底层召回。
+        # 这里真正打到的是索引/向量检索层，返回原始候选集合 `sres`。
         sres = await self.search(req, [index_name(tid) for tid in tenant_ids], kb_ids, embd_mdl, highlight,
                            rank_feature=rank_feature)
 
+        # 如果显式提供了 rerank 模型，并且底层召回有结果，则优先使用外部 rerank 模型重排。
         if rerank_mdl and sres.total > 0:
             sim, tsim, vsim = self.rerank_by_model(
                 rerank_mdl,
@@ -414,14 +454,15 @@ class Dealer:
                 rank_feature=rank_feature,
             )
         else:
+            # 没有外部 rerank 模型时，按底层引擎特性选择内置排序逻辑。
             if settings.DOC_ENGINE_INFINITY:
-                # Don't need rerank here since Infinity normalizes each way score before fusion.
+                # Infinity 已经在底层做了较好的分数归一和融合，因此这里直接复用 `_score`。
                 sim = [sres.field[id].get("_score", 0.0) for id in sres.ids]
                 sim = [s if s is not None else 0.0 for s in sim]
                 tsim = sim
                 vsim = sim
             else:
-                # ElasticSearch doesn't normalize each way score before fusion.
+                # Elastic/OpenSearch 的文本分和向量分还需要在应用层再做一次融合排序。
                 sim, tsim, vsim = self.rerank(
                     sres,
                     question,
@@ -430,39 +471,49 @@ class Dealer:
                     rank_feature=rank_feature,
                 )
 
+        # 转成 numpy 数组，方便后面统一排序和阈值过滤。
         sim_np = np.array(sim, dtype=np.float64)
+        # 没有任何候选分数时，直接返回空结果。
         if sim_np.size == 0:
             ranks["doc_aggs"] = []
             return ranks
 
+        # 按融合分从高到低排序。
         sorted_idx = np.argsort(sim_np * -1)
 
-        # When vector_similarity_weight is 0, similarity_threshold is not meaningful for term-only scores.
+        # 当 `vector_similarity_weight=0` 时，说明当前基本是纯词法检索。
+        # 这时向量相似度阈值没有实际意义，因此把后置阈值降为 0。
         post_threshold = 0.0 if vector_similarity_weight <= 0 else similarity_threshold
 
-        # When doc_ids is explicitly provided (metadata or document filtering), bypass threshold
-        # User wants those specific documents regardless of their relevance score
+        # 如果调用方显式指定了 doc_ids，则跳过相似度阈值过滤。
+        # 这样做是因为此时用户要的是“限定在这些文档里检索”，而不是再按分数把这些文档过滤掉。
         if doc_ids:
             post_threshold = 0.0
 
+        # 过滤掉低于阈值的候选，并记录命中总数。
         valid_idx = [int(i) for i in sorted_idx if sim_np[i] >= post_threshold]
         filtered_count = len(valid_idx)
         ranks["total"] = int(filtered_count)
 
+        # 全部候选都被阈值裁掉时，直接返回空结果。
         if filtered_count == 0:
             ranks["doc_aggs"] = []
             return ranks
 
+        # 在重排后的候选集合上再做分页。
+        # 这样做不是“先分页再排序”，而是“先多召回、先重排、再分页”，排序质量更稳定。
         max_pages = max(RERANK_LIMIT // max(page_size, 1), 1)
         page_index = (page - 1) % max_pages
         begin = page_index * page_size
         end = begin + page_size
         page_idx = valid_idx[begin:end]
 
+        # 动态推断查询向量维度，并确定当前 chunk 中向量字段名。
         dim = len(sres.query_vector)
         vector_column = f"q_{dim}_vec"
         zero_vector = [0.0] * dim
 
+        # 组装当前页真正返回的 chunk 列表。
         for i in page_idx:
             id = sres.ids[i]
             chunk = sres.field[id]
@@ -490,12 +541,15 @@ class Dealer:
                 "row_id": chunk.get("row_id()"),
             }
             if highlight and sres.highlight:
+                # 如果开启高亮，就优先使用高亮内容；否则回退到原始文本。
                 if id in sres.highlight:
                     d["highlight"] = remove_redundant_spaces(sres.highlight[id])
                 else:
                     d["highlight"] = d["content_with_weight"]
             ranks["chunks"].append(d)
 
+        # 可选地构造按文档聚合的命中统计。
+        # 注意聚合统计基于全部有效候选 `valid_idx`，而不是仅当前页，所以它反映的是整体命中情况。
         if aggs:
             for i in valid_idx:
                 id = sres.ids[i]
@@ -518,8 +572,10 @@ class Dealer:
                 )
             ]
         else:
+            # 如果调用方不需要聚合结果，就返回空列表。
             ranks["doc_aggs"] = []
 
+        # 返回本次检索结果。
         return ranks
 
     def sql_retrieval(self, sql, fetch_size=128, format="json"):

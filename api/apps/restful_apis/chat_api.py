@@ -51,20 +51,35 @@ from rag.prompts.generator import chunks_format
 from rag.prompts.template import load_prompt
 
 _DEFAULT_PROMPT_CONFIG = {
+    # 默认 system prompt。
+    # 这段提示词定义了默认聊天的基本行为：基于数据集内容回答、尽量详细列数据、无关时必须返回固定兜底句、
+    # 并显式把 `{knowledge}` 作为知识库注入点，供后续 `_apply_prompt_defaults()` 和 `async_chat()` 链路展开。
     "system": (
-        'You are an intelligent assistant. Please summarize the content of the dataset to answer the question. '
-        'Please list the data in the dataset and answer in detail. When all dataset content is irrelevant to the '
-        'question, your answer must include the sentence "The answer you are looking for is not found in the dataset!" '
-        "Answers need to consider chat history.\n"
-        "      Here is the knowledge base:\n"
+        '你是一个智能助手。请总结数据集中的内容来回答问题。'
+        '请列出数据集中的数据，并进行详细回答。当数据集中的所有内容都与问题无关时，'
+        '你的回答中必须包含这句话：“The answer you are looking for is not found in the dataset!”'
+        "回答时需要结合聊天历史。\n"
+        "      下面是知识库：\n"
         "      {knowledge}\n"
-        "      The above is the knowledge base."
+        "      以上是知识库内容。"
     ),
+    # 新建会话时 assistant 的默认开场白。
+    # 这样做是为了让首次创建 chat 时前端能立刻显示一条可见欢迎语，而不是空会话。
     "prologue": "Hi! I'm your assistant. What can I do for you?",
+    # 默认 prompt 参数列表。
+    # 这里声明 `knowledge` 是必填参数，意味着这套默认 prompt 期望由检索链路向 system prompt 注入知识文本。
     "parameters": [{"key": "knowledge", "optional": False}],
+    # 当知识库没有召回出可用内容时的默认兜底回复。
+    # 这样做是为了避免模型在“无知识可答”场景下自由发挥，统一返回明确提示。
     "empty_response": "Sorry! No relevant content was found in the knowledge base!",
+    # 默认开启引用能力。
+    # 这样做会让后续 `async_chat()` 在生成后尝试插入或修复 citation，返回带 reference 的答案。
     "quote": True,
+    # 默认关闭 TTS。
+    # 这样做是为了避免所有聊天请求都额外触发语音合成，降低默认成本和延迟。
     "tts": False,
+    # 默认开启多轮问题改写。
+    # 这样做是为了在多轮聊天里把当前问题与历史上下文融合，提升 retrieval 命中率。
     "refine_multiturn": True,
 }
 _DEFAULT_RERANK_MODELS = {"BAAI/bge-reranker-v2-m3", "maidalun1020/bce-reranker-base_v1"}

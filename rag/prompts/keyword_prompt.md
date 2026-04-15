@@ -1,16 +1,16 @@
-## Role
-You are a text analyzer.
+## 角色
+你是一个文本分析助手。
 
-## Task
-Extract the most important keywords/phrases of a given piece of text content.
+## 任务
+从给定的文本内容中提取最重要的关键词或关键短语。
 
-## Requirements
-- Summarize the text content, and give the top {{ topn }} important keywords/phrases.
-- The keywords MUST be in the same language as the given piece of text content.
-- The keywords are delimited by ENGLISH COMMA.
-- Output keywords ONLY.
+## 要求
+- 先概括文本内容，再给出最重要的前 {{ topn }} 个关键词或关键短语。
+- 关键词必须与输入文本保持相同语言。
+- 关键词之间使用英文逗号分隔。
+- 只输出关键词，不要输出任何额外说明。
 
 ---
 
-## Text Content
+## 文本内容
 {{ content }}

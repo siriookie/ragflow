@@ -1,7 +1,6 @@
-**Input:**
+**输入：**
 {{ query }}
 ===
 {{ languages | join(', ') }}
 
-**Output:**
-
+**输出：**

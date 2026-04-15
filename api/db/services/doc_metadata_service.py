@@ -704,58 +704,84 @@ class DocMetadataService:
             Metadata dictionary in format: {field_name: {value: [doc_ids]}}
         """
         try:
-            # Get tenant_id from first KB
+            # 用传入的第一个知识库 ID 查询知识库对象。
+            # 这里默认 kb_ids 中的知识库属于同一个 tenant，因此后面只取第一个 KB 的 tenant_id 来定位元数据索引。
             kb = Knowledgebase.get_by_id(kb_ids[0])
+            # 如果第一个知识库都不存在，说明无法确定租户和索引，直接返回空结果。
             if not kb:
                 return {}
 
+            # 取出租户 ID，用于拼接该租户对应的文档元数据索引名。
             tenant_id = kb.tenant_id
+            # 根据 tenant_id 生成存储文档 metadata 的索引/表名。
             index_name = cls._get_doc_meta_index_name(tenant_id)
 
+            # 构造查询条件：只查询这些知识库下的文档元数据。
             condition = {"kb_id": kb_ids}
+            # 创建排序表达式对象。
+            # 当前没有显式添加排序字段，但 search 接口要求传入该对象。
             order_by = OrderByExpr()
 
-            # Query with large limit
+            # 一次性尽量多拉取元数据记录，避免调用方还要做分页聚合。
+            # 这里查询的是原始 metadata 文档，不是最终返回值。
             results = settings.docStoreConn.search(
-                select_fields=["*"],  # Get all fields
-                highlight_fields=[],
-                condition=condition,
-                match_expressions=[],
-                order_by=order_by,
-                offset=0,
-                limit=10000,
-                index_names=index_name,
-                knowledgebase_ids=kb_ids
+                select_fields=["*"],  # 查询全部字段，后续需要从结果里提取 meta_fields。
+                highlight_fields=[],  # metadata 聚合场景不需要高亮。
+                condition=condition,  # 按知识库 ID 过滤。
+                match_expressions=[],  # 这里不做全文匹配，只做条件过滤。
+                order_by=order_by,  # 传入排序对象。
+                offset=0,  # 从第一页开始取。
+                limit=10000,  # 最多取 10000 条，适合当前聚合场景。
+                index_names=index_name,  # 指定查询的 metadata 索引。
+                knowledgebase_ids=kb_ids  # 额外传入知识库范围，兼容底层不同存储实现。
             )
 
+            # 记录查询上下文，方便排查元数据聚合问题。
             logging.debug(f"[get_flatted_meta_by_kbs] index_name: {index_name}, kb_ids: {kb_ids}")
+            # 记录底层返回结果类型，因为 ES / Infinity / OceanBase 的返回结构可能不同。
             logging.debug(f"[get_flatted_meta_by_kbs] results type: {type(results)}")
 
-            # Aggregate metadata
+            # 最终返回的聚合结构：
+            # {
+            #   "字段名": {
+            #       "字段值字符串": [doc_id1, doc_id2, ...]
+            #   }
+            # }
             meta = {}
 
-            # Use helper to iterate over results in any format
+            # 统一遍历不同存储引擎返回的结果格式，拿到标准化的 (doc_id, doc)。
             for doc_id, doc in cls._iter_search_results(results):
-                # Extract metadata fields (exclude system fields)
+                # 从单条文档记录中提取业务 metadata。
+                # _extract_metadata 会自动处理 JSON 字符串或 dict 两种格式。
                 doc_meta = cls._extract_metadata(doc)
 
+                # 遍历当前文档中的每一个 metadata 字段。
                 for k, v in doc_meta.items():
+                    # 如果这是该字段第一次出现，先初始化字段级字典。
                     if k not in meta:
                         meta[k] = {}
 
+                    # 统一把单值和列表值转成列表，便于后续用同一套逻辑处理。
                     values = v if isinstance(v, list) else [v]
+                    # 遍历该字段的每一个具体值。
                     for vv in values:
+                        # 跳过空值，避免把 None 聚合成一个无意义的筛选项。
                         if vv is None:
                             continue
+                        # 把值转成字符串作为 key，保证不同基础类型都能参与聚合和筛选。
                         sv = str(vv)
+                        # 如果该字段下还没有这个值，就初始化文档 ID 列表。
                         if sv not in meta[k]:
                             meta[k][sv] = []
+                        # 把当前文档 ID 追加进去，表示该文档包含这个 metadata 值。
                         meta[k][sv].append(doc_id)
 
+            # 输出最终聚合结果，便于调试 metadata_condition 相关逻辑。
             logging.debug(f"[get_flatted_meta_by_kbs] KBs: {kb_ids}, Returning metadata: {meta}")
             return meta
 
         except Exception as e:
+            # 任意异常都兜底返回空字典，避免调用链因为 metadata 聚合失败而中断。
             logging.error(f"Error getting flattened metadata for KBs {kb_ids}: {e}")
             return {}
 

@@ -179,48 +179,74 @@ async def apply_meta_data_filter(
         list of doc_ids, ["-999"] when manual filters yield no result, or None
         when auto/semi_auto filters return empty.
     """
+    # 延迟导入 `gen_meta_filter`，避免模块级循环依赖。
+    # 这样做是因为 `generator` 和 metadata 工具之间存在互相调用关系。
     from rag.prompts.generator import gen_meta_filter # move from the top of the file to avoid circular import
 
+    # 以调用方传入的 `base_doc_ids` 作为初始候选集合。
+    # 这样做是为了支持“先有一层文档范围限制，再叠加元数据过滤”的场景。
     doc_ids = list(base_doc_ids) if base_doc_ids else []
 
+    # 没有元数据过滤配置时，直接返回当前候选集合。
     if not meta_data_filter:
         return doc_ids
 
+    # 读取过滤模式。
     method = meta_data_filter.get("method")
 
     if method == "auto":
+        # `auto` 模式下，让 LLM 基于问题和全部可用元数据自动生成过滤条件。
         filters: dict = await gen_meta_filter(chat_mdl, metas, question)
+        # 把自动生成的条件交给 `meta_filter` 执行，并把结果并入当前 doc_ids。
         doc_ids.extend(meta_filter(metas, filters["conditions"], filters.get("logic", "and")))
+        # auto 模式如果没有筛出结果，返回 None。
+        # 这样做通常表示“自动推断的过滤条件没有命中”，上层可以据此走更宽松的回退逻辑。
         if not doc_ids:
             return None
     elif method == "semi_auto":
+        # `semi_auto` 模式下，只允许模型在指定元数据键范围内推断过滤条件。
+        # 同时还可以为某些键显式限定允许使用的操作符。
         selected_keys = []
         constraints = {}
         for item in meta_data_filter.get("semi_auto", []):
+            # 纯字符串表示“只开放这个元数据键给模型使用”。
             if isinstance(item, str):
                 selected_keys.append(item)
             elif isinstance(item, dict):
+                # 字典形式除了指定键，还可以限定 op。
                 key = item.get("key")
                 op = item.get("op")
                 selected_keys.append(key)
                 if op:
                     constraints[key] = op
 
+        # 只有真的选出了键，才继续做半自动过滤。
         if selected_keys:
+            # 只截取被允许参与推断的那部分元数据。
             filtered_metas = {key: metas[key] for key in selected_keys if key in metas}
             if filtered_metas:
+                # 让 LLM 在受限元数据集合上生成条件。
                 filters: dict = await gen_meta_filter(chat_mdl, filtered_metas, question, constraints=constraints)
+                # 注意这里执行过滤时仍然传原始 `metas`，因为条件键虽然受限，但最终匹配要基于完整元数据映射执行。
                 doc_ids.extend(meta_filter(metas, filters["conditions"], filters.get("logic", "and")))
+                # semi_auto 没命中时也返回 None，含义与 auto 一致。
                 if not doc_ids:
                     return None
     elif method == "manual":
+        # `manual` 模式完全不让模型推断，直接使用前端/调用方给定的过滤条件。
         filters = meta_data_filter.get("manual", [])
         if manual_value_resolver:
+            # 如果提供了自定义 resolver，就先把手动条件做一次值解析。
+            # 这样做是为了支持把动态占位值转换成最终过滤值。
             filters = [manual_value_resolver(flt) for flt in filters]
+        # 手动条件直接交给 `meta_filter` 执行。
         doc_ids.extend(meta_filter(metas, filters, meta_data_filter.get("logic", "and")))
+        # manual 模式下，如果明确给了过滤条件但没有结果，返回 `["-999"]` 而不是 None。
+        # 这样做通常是为了向上层明确表达“手动筛选后结果为空”，避免被误判成“没做过滤”或触发自动回退。
         if filters and not doc_ids:
             doc_ids = ["-999"]
 
+    # 返回最终过滤后的 doc_ids。
     return doc_ids
 
 
