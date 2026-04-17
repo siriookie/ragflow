@@ -1,122 +1,123 @@
-Based on the provided document or chat history, add citations to the input text using the format specified later. 
+基于提供的文档或聊天历史，请按照后文规定的格式为输入文本添加引用。
 
-# Citation Requirements:
+# 引用要求：
 
-## Technical Rules:
-- Use format: [ID:i] or [ID:i] [ID:j] for multiple sources
-- Place citations at the end of sentences, before punctuation
-- Maximum 4 citations per sentence
-- DO NOT cite content not from <context></context>
-- DO NOT modify whitespace or original text
-- STRICTLY prohibit non-standard formatting (~~, etc.)
-- For RTL languages (Arabic, Hebrew, Persian): Place citations at the logical end of sentences (same position as LTR). The frontend handles bidirectional rendering automatically.
+## 技术规则：
+- 使用格式：`[ID:i]` 或多个来源时使用 `[ID:i] [ID:j]`
+- 将引用放在句子末尾、标点符号之前
+- 每个句子最多 4 个引用
+- **不要** 为不来自 `<context></context>` 的内容添加引用
+- **不要** 修改空白字符或原始文本
+- **严格禁止** 使用非标准格式（如 `~~` 等）
+- 对于 RTL 语言（阿拉伯语、希伯来语、波斯语）：引用仍应放在句子的逻辑结尾位置（与 LTR 语言相同）。前端会自动处理双向文本渲染。
 
-## What MUST Be Cited:
-1. **Quantitative data**: Numbers, percentages, statistics, measurements
-2. **Temporal claims**: Dates, timeframes, sequences of events  
-3. **Causal relationships**: Claims about cause and effect
-4. **Comparative statements**: Rankings, comparisons, superlatives
-5. **Technical definitions**: Specialized terms, concepts, methodologies
-6. **Direct attributions**: What someone said, did, or believes
-7. **Predictions/forecasts**: Future projections, trend analyses
-8. **Controversial claims**: Disputed facts, minority opinions
+## 必须添加引用的内容：
+1. **定量数据**：数字、百分比、统计数据、测量值
+2. **时间性陈述**：日期、时间范围、事件先后顺序
+3. **因果关系**：关于因果影响的陈述
+4. **比较性陈述**：排名、比较、最高级/最强级表达
+5. **技术定义**：专业术语、概念、方法论
+6. **直接归因**：某人说了什么、做了什么、相信什么
+7. **预测/展望**：未来预测、趋势分析
+8. **争议性陈述**：存在争议的事实、少数派观点
 
-## What Should NOT Be Cited:
-- Common knowledge (e.g., "The sun rises in the east")
-- Transitional phrases
-- General introductions
-- Your own analysis or synthesis (unless directly from source)
+## 不应添加引用的内容：
+- 常识性内容（例如：“太阳从东方升起”）
+- 过渡性短语
+- 一般性开场介绍
+- 你自己的分析或综合判断（除非它直接来自来源）
 
-# Comprehensive Examples:
+# 完整示例：
 
-## Example 1: Data and Statistics
+## 示例 1：数据与统计
 <context>
 ID: 45
-└── Content: The global smartphone market grew by 7.8% in Q3 2024, with Samsung holding 20.6% market share and Apple at 15.8%.
+├── Content: 2024 年第三季度，全球智能手机市场增长了 7.8%，其中三星占据 20.6% 的市场份额，苹果占 15.8%。
 
-ID: 46  
-└── Content: 5G adoption reached 1.5 billion users worldwide by October 2024.
+ID: 46
+├── Content: 到 2024 年 10 月，全球 5G 用户数已达到 15 亿。
 </context>
 
-USER: How is the smartphone market performing?
+USER: 智能手机市场表现如何？
 
-ASSISTANT: 
-The smartphone industry is showing strong recovery. The global smartphone market grew by 7.8% in Q3 2024 [ID:45]. Samsung leads with 20.6% market share, followed by Apple at 15.8% [ID:45]. This growth is partly driven by 5G technology, which reached 1.5 billion users worldwide by October 2024 [ID:46].
+ASSISTANT:
+智能手机行业正在强劲复苏。2024 年第三季度，全球智能手机市场增长了 7.8% [ID:45]。三星以 20.6% 的市场份额领先，苹果以 15.8% 位居其后 [ID:45]。这种增长部分得益于 5G 技术，到 2024 年 10 月，其全球用户数已达到 15 亿 [ID:46]。
 
-## Example 2: Causal Relationships and Predictions
+## 示例 2：因果关系与预测
 <context>
 ID: 78
-└── Content: Rising interest rates have led to a 15% decline in housing starts. Economists predict this trend will continue through 2025.
+├── Content: 利率上升已导致新屋开工量下降 15%。经济学家预测这一趋势将持续到 2025 年。
 
 ID: 79
-└── Content: The Federal Reserve's aggressive monetary policy is the primary driver behind the real estate slowdown.
+├── Content: 美联储激进的货币政策是房地产市场放缓的主要驱动因素。
 </context>
 
-USER: What's happening in the real estate market?
+USER: 房地产市场发生了什么？
 
 ASSISTANT:
-The real estate market is experiencing significant challenges. Rising interest rates have led to a 15% decline in housing starts [ID:78]. The Federal Reserve's aggressive monetary policy is the primary driver behind this real estate slowdown [ID:79]. Economists predict this trend will continue through 2025 [ID:78]. These factors suggest a prolonged period of market adjustment ahead.
+房地产市场正面临显著挑战。利率上升已导致新屋开工量下降 15% [ID:78]。美联储激进的货币政策是此次房地产放缓的主要驱动因素 [ID:79]。经济学家预测这一趋势将持续到 2025 年 [ID:78]。这些因素表明，市场调整期可能会持续较长时间。
 
-## Example 3: Technical Concepts and Comparisons
+## 示例 3：技术概念与比较
 <context>
 ID: 101
-└── Content: Quantum computing uses quantum bits (qubits) that can exist in superposition, unlike classical bits which are either 0 or 1.
+├── Content: 量子计算使用量子比特（qubits），它们可以处于叠加态；而经典比特只能是 0 或 1。
 
 ID: 102
-└── Content: Current quantum computers can solve certain problems 158 million times faster than classical supercomputers.
+├── Content: 当前的量子计算机在某些问题上可比经典超级计算机快 1.58 亿倍。
 </context>
 
-USER: Explain quantum computing advantages.
+USER: 解释一下量子计算的优势。
 
 ASSISTANT:
-Quantum computing represents a fundamental shift in computational capability. Unlike classical computers, quantum computing uses quantum bits (qubits) that can exist in superposition, rather than being limited to just 0 or 1 [ID:101]. This unique property enables extraordinary performance gains. Current quantum computers can solve certain problems 158 million times faster than classical supercomputers [ID:102]. This technology promises to revolutionize fields requiring complex calculations.
+量子计算代表了计算能力上的根本性变革。与经典计算机不同，量子计算使用可处于叠加态的量子比特（qubits），而不是只能局限于 0 或 1 [ID:101]。这一独特性质带来了极其显著的性能提升。当前量子计算机在某些问题上可比经典超级计算机快 1.58 亿倍 [ID:102]。这项技术有望彻底改变需要复杂计算的诸多领域。
 
-## Example 4: Mixed Citation Needs
+## 示例 4：混合引用需求
 <context>
 ID: 201
-└── Content: CEO Jane Smith announced: "We're pivoting to AI-first strategy, expecting 40% revenue growth by 2026."
+├── Content: CEO Jane Smith 宣布：“我们将转向 AI-first 战略，并预计到 2026 年实现 40% 的收入增长。”
 
 ID: 202
-└── Content: Industry analysts remain skeptical, with Morgan Stanley rating the stock as "underperform."
+├── Content: 行业分析师仍持怀疑态度，摩根士丹利给予该股票“跑输大盘”的评级。
 
 ID: 203
-└── Content: The company's AI division currently represents only 5% of total revenue.
+├── Content: 该公司的 AI 业务目前仅占总收入的 5%。
 </context>
 
-USER: What's the company's new strategy?
+USER: 这家公司的新战略是什么？
 
 ASSISTANT:
-The company is undergoing a major strategic transformation. CEO Jane Smith announced: "We're pivoting to AI-first strategy, expecting 40% revenue growth by 2026" [ID:201]. However, this ambitious goal faces skepticism, as industry analysts remain doubtful, with Morgan Stanley rating the stock as "underperform" [ID:202]. The challenge is significant given that the company's AI division currently represents only 5% of total revenue [ID:203]. Success will depend on execution of this bold vision.
+这家公司正在经历一场重大战略转型。CEO Jane Smith 宣布：“我们将转向 AI-first 战略，并预计到 2026 年实现 40% 的收入增长” [ID:201]。然而，这一雄心勃勃的目标也面临质疑，行业分析师对此保持怀疑，摩根士丹利甚至给予该股票“跑输大盘”的评级 [ID:202]。考虑到该公司的 AI 业务目前仅占总收入的 5%，这一挑战尤为明显 [ID:203]。成败将取决于这一大胆愿景的执行情况。
 
-## Example 5: When NOT to Cite
+## 示例 5：什么时候不该加引用
 <context>
 ID: 301
-└── Content: Paris is the capital of France. The Eiffel Tower was completed in 1889.
+├── Content: 巴黎是法国的首都。埃菲尔铁塔于 1889 年建成。
 </context>
 
-USER: Tell me about Paris.
+USER: 介绍一下巴黎。
 
 ASSISTANT:
-Paris is the capital of France. It's known for its rich history, culture, and architecture. The Eiffel Tower was completed in 1889 [ID:301]. The city attracts millions of tourists annually. Paris remains one of the world's most visited destinations.
-(Note: Only the specific date needs citation, not common knowledge about Paris)
+巴黎是法国的首都。它以丰富的历史、文化和建筑而闻名。埃菲尔铁塔于 1889 年建成 [ID:301]。这座城市每年吸引数百万游客。巴黎始终是世界上游客最多的城市之一。
+（注意：这里只需要为具体日期添加引用，而不需要为关于巴黎的常识加引用。）
 
-## Example 6: RTL Language (Arabic)
+## 示例 6：RTL 语言（阿拉伯语）
 <context>
 ID: 401
-└── Content: في أول أيام شهر رمضان، أثار وضع رأس خنزير على مدخل مسجد بمدينة سانت أومير شمالي فرنسا تفاعلات واسعة.
+├── Content: 賮賷 兀賵賱 兀賷丕賲 卮賴乇 乇賲囟丕賳貙 兀孬丕乇 賵囟毓 乇兀爻 禺賳夭賷乇 毓賱賶 賲丿禺賱 賲爻噩丿 亘賲丿賷賳丞 爻丕賳鬲 兀賵賲賷乇 卮賲丕賱賷 賮乇賳爻丕 鬲賮丕毓賱丕鬲 賵丕爻毓丞.
 </context>
 
-USER: ماذا حدث في رمضان؟
+USER: 賲丕匕丕 丨丿孬 賮賷 乇賲囟丕賳責
 
 ASSISTANT:
-في أول أيام شهر رمضان، أثار وضع رأس خنزير على مدخل مسجد بمدينة سانت أومير شمالي فرنسا تفاعلات واسعة [ID:401].
-(Note: Citation is placed at the logical end of the sentence, same as LTR languages. The frontend handles RTL display automatically.)
+賮賷 兀賵賱 兀賷丕賲 卮賴乇 乇賲囟丕賳貙 兀孬丕乇 賵囟毓 乇兀爻 禺賳夭賷乇 毓賱賶 賲丿禺賱 賲爻噩丿 亘賲丿賷賳丞 爻丕賳鬲 兀賵賲賷乇 卮賲丕賱賷 賮乇賳爻丕 鬲賮丕毓賱丕鬲 賵丕爻毓丞 [ID:401].
+（注意：引用放在句子的逻辑结尾位置，与 LTR 语言一致。前端会自动处理 RTL 显示。）
 
---- Examples END ---
+--- 示例结束 ---
 
-REMEMBER: 
-- Cite FACTS, not opinions or transitions
-- Each citation supports the ENTIRE sentence
-- When in doubt, ask: "Would a fact-checker need to verify this?"
-- Place citations at sentence end, before punctuation
-- Format likes this is FORBIDDEN: [ID:0, ID:5, ID:...]. It MUST be separated like, [ID:0][ID:5]...
+请牢记：
+- 给“事实”加引用，而不是给观点或过渡语加引用
+- 每个引用都必须支撑该**整句话**
+- 如果拿不准，就问自己：“事实核查人员是否需要验证这句话？”
+- 将引用放在句尾、标点前
+- 严禁使用这种格式：`[ID:0, ID:5, ID:...]`
+- 多个引用必须拆开写成：`[ID:0][ID:5]...` 或 `[ID:0] [ID:5]...`

@@ -103,7 +103,14 @@ def get_llm_cache(llmnm, txt, history, genconf):
         return None
     return bin
 
-
+# 包含：
+#
+# llmnm：模型名字（比如 gpt-4 / qwen）
+# txt：当前用户输入
+# history：对话历史
+# genconf：生成参数（temperature / top_p 等）
+#
+# 👉 拼接后做 hash（xxhash 比 md5 更快）
 def set_llm_cache(llmnm, txt, v, history, genconf):
     hasher = xxhash.xxh64()
     hasher.update((str(llmnm)+str(txt)+str(history)+str(genconf)).encode("utf-8"))
@@ -618,22 +625,89 @@ def merge_tuples(list1, list2):
                 result.append(tup)
     return result
 
+#
+# 返回值大致是这种结构：
+#
+# {
+#     "人物": ["诸葛亮", "刘备", "曹操"],
+#     "地点": ["成都", "荆州", "许昌"],
+#     "组织": ["蜀汉", "曹魏"]
+# }
+# 也就是说：
+#
+# key 是实体类型
+# value 是这个类型下面的一些示例实体
+# 这些数据不是现算出来的，而是之前已经存进知识图谱索引里的 ty2ents 记录。
+#
+# 它为什么要做这件事
+# 因为 query_rewrite 要让 LLM 帮忙判断：
+#
+# 用户问题里提到了哪些实体
+# 用户想问的答案更可能属于哪些实体类型
+# 但如果只给模型一个裸问题，模型容易泛化得太随意。
+#
+# 所以这里先从当前知识库真实存在的图谱里，拿一份“类型样本池”给它，比如：
+#
+# {
+#   "人物": ["诸葛亮", "刘备", "曹操"],
+#   "地点": ["成都", "荆州"],
+#   "事件": ["赤壁之战", "夷陵之战"]
+# }
+# 然后模型就更容易理解：
+#
+# “刘备在哪里建立蜀汉？”
+# 这里可能涉及的类型有 人物、地点、组织
+# 举个具体例子
+#
+# 假设你的知识图谱里有两条 ty2ents 记录，存储内容分别是：
+#
+# 第一条：
+#
+# {
+#   "人物": ["刘备", "关羽"],
+#   "地点": ["荆州"]
+# }
+# 第二条：
+#
+# {
+#   "人物": ["诸葛亮", "曹操"],
+#   "组织": ["蜀汉", "曹魏"]
+# }
+# get_entity_type2samples(...) 读出来后会聚合成：
+#
+# {
+#     "人物": ["刘备", "关羽", "诸葛亮", "曹操"],
+#     "地点": ["荆州"],
+#     "组织": ["蜀汉", "曹魏"]
+# }
+# 然后 query_rewrite(...) 会把这份结果塞进 prompt 里，让模型基于这些真实样本去判断问题。
 
 async def get_entity_type2samples(idxnms, kb_ids: list):
+    # 查询知识图谱里预先存好的 “实体类型 -> 示例实体列表” 记录。
+    # 这些记录的 knowledge_graph_kwd 固定为 ty2ents，内容放在 content_with_weight 字段中。
     es_res = await settings.retriever.search({"knowledge_graph_kwd": "ty2ents", "kb_id": kb_ids, "size": 10000, "fields": ["content_with_weight"]},idxnms,kb_ids)
 
+    # 用 defaultdict(list) 聚合同名实体类型下的所有示例实体。
     res = defaultdict(list)
+    # 遍历所有命中的 ty2ents 记录。
     for id in es_res.ids:
+        # 取出这条记录里存储的实体类型样本内容。
         smp = es_res.field[id].get("content_with_weight")
+        # 没有内容就直接跳过。
         if not smp:
             continue
         try:
+            # content_with_weight 里存的是 JSON 字符串，解析成字典结构。
             smp = json.loads(smp)
         except Exception as e:
+            # 解析失败时记录异常，但不中断整个聚合流程。
             logging.exception(e)
 
+        # smp 的结构通常是 {实体类型: [示例实体1, 示例实体2, ...]}。
+        # 把每种类型下的示例实体合并进最终结果。
         for ty, ents in smp.items():
             res[ty].extend(ents)
+    # 返回 “实体类型 -> 示例实体列表” 的聚合结果。
     return res
 
 

@@ -6,213 +6,213 @@ Reference:
 """
 PROMPTS = {}
 
-PROMPTS["minirag_query2kwd"] = """---Role---
+PROMPTS["minirag_query2kwd"] = """---角色---
 
-You are a helpful assistant tasked with identifying both answer-type and low-level keywords in the user's query.
+你是一名有帮助的助手，任务是识别用户问题中的“答案类型关键词”和“底层实体关键词”。
 
----Goal---
+---目标---
 
-Given the query, list both answer-type and low-level keywords.
-answer_type_keywords focus on the type of the answer to the certain query, while low-level keywords focus on specific entities, details, or concrete terms.
-The answer_type_keywords must be selected from Answer type pool. 
-This pool is in the form of a dictionary, where the key represents the Type you should choose from and the value represents the example samples.
+给定一个问题，请同时列出答案类型关键词和底层关键词。
+其中，answer_type_keywords 关注“这个问题的答案属于什么类型”，而底层关键词关注具体实体、细节或明确术语。
+answer_type_keywords 必须从“答案类型池”中选择。
+答案类型池是一个字典结构，其中 key 表示可选类型，value 表示该类型对应的示例样本。
 
----Instructions---
+---说明---
 
-- Output the keywords in JSON format.
-- The JSON should have three keys:
-  - "answer_type_keywords" for the types of the answer. In this list, the types with the highest likelihood should be placed at the forefront. No more than 3.
-  - "entities_from_query" for specific entities or details. It must be extracted from the query.
+- 以 JSON 格式输出关键词。
+- JSON 中应包含两个键：
+  - "answer_type_keywords"：表示答案所属的类型。最有可能的类型应排在最前面。最多 3 个。
+  - "entities_from_query"：表示问题中的具体实体或细节，必须从问题中提取。
 ######################
--Examples-
+-示例-
 ######################
-Example 1:
+示例 1：
 
-Query: "How does international trade influence global economic stability?"
-Answer type pool: {{
- 'PERSONAL LIFE': ['FAMILY TIME', 'HOME MAINTENANCE'],
- 'STRATEGY': ['MARKETING PLAN', 'BUSINESS EXPANSION'],
- 'SERVICE FACILITATION': ['ONLINE SUPPORT', 'CUSTOMER SERVICE TRAINING'],
- 'PERSON': ['JANE DOE', 'JOHN SMITH'],
- 'FOOD': ['PASTA', 'SUSHI'],
- 'EMOTION': ['HAPPINESS', 'ANGER'],
- 'PERSONAL EXPERIENCE': ['TRAVEL ABROAD', 'STUDYING ABROAD'],
- 'INTERACTION': ['TEAM MEETING', 'NETWORKING EVENT'],
- 'BEVERAGE': ['COFFEE', 'TEA'],
- 'PLAN': ['ANNUAL BUDGET', 'PROJECT TIMELINE'],
- 'GEO': ['NEW YORK CITY', 'SOUTH AFRICA'],
- 'GEAR': ['CAMPING TENT', 'CYCLING HELMET'],
- 'EMOJI': ['🎉', '🚀'],
- 'BEHAVIOR': ['POSITIVE FEEDBACK', 'NEGATIVE CRITICISM'],
- 'TONE': ['FORMAL', 'INFORMAL'],
- 'LOCATION': ['DOWNTOWN', 'SUBURBS']
+问题: "国际贸易如何影响全球经济稳定？"
+答案类型池: {{
+ '个人生活': ['家庭时光', '家庭维护'],
+ '策略': ['营销计划', '业务扩张'],
+ '服务支持': ['在线支持', '客服培训'],
+ '人物': ['张三', '李四'],
+ '食物': ['意大利面', '寿司'],
+ '情绪': ['快乐', '愤怒'],
+ '个人经历': ['出国旅行', '留学经历'],
+ '互动': ['团队会议', '社交活动'],
+ '饮品': ['咖啡', '茶'],
+ '计划': ['年度预算', '项目时间表'],
+ '地理': ['纽约市', '南非'],
+ '装备': ['露营帐篷', '骑行头盔'],
+ '表情符号': ['庆祝表情', '困惑表情'],
+ '行为': ['正向反馈', '负面批评'],
+ '语气': ['正式', '非正式'],
+ '地点': ['市中心', '郊区']
 }}
 ################
-Output:
+输出:
 {{
-  "answer_type_keywords": ["STRATEGY","PERSONAL LIFE"],
-  "entities_from_query": ["Trade agreements", "Tariffs", "Currency exchange", "Imports", "Exports"]
+  "answer_type_keywords": ["策略", "个人生活"],
+  "entities_from_query": ["贸易协定", "关税", "汇率", "进口", "出口"]
 }}
 #############################
-Example 2:
+示例 2：
 
-Query: "When was SpaceX's first rocket launch?"
-Answer type pool: {{
- 'DATE AND TIME': ['2023-10-10 10:00', 'THIS AFTERNOON'],
- 'ORGANIZATION': ['GLOBAL INITIATIVES CORPORATION', 'LOCAL COMMUNITY CENTER'],
- 'PERSONAL LIFE': ['DAILY EXERCISE ROUTINE', 'FAMILY VACATION PLANNING'],
- 'STRATEGY': ['NEW PRODUCT LAUNCH', 'YEAR-END SALES BOOST'],
- 'SERVICE FACILITATION': ['REMOTE IT SUPPORT', 'ON-SITE TRAINING SESSIONS'],
- 'PERSON': ['ALEXANDER HAMILTON', 'MARIA CURIE'],
- 'FOOD': ['GRILLED SALMON', 'VEGETARIAN BURRITO'],
- 'EMOTION': ['EXCITEMENT', 'DISAPPOINTMENT'],
- 'PERSONAL EXPERIENCE': ['BIRTHDAY CELEBRATION', 'FIRST MARATHON'],
- 'INTERACTION': ['OFFICE WATER COOLER CHAT', 'ONLINE FORUM DEBATE'],
- 'BEVERAGE': ['ICED COFFEE', 'GREEN SMOOTHIE'],
- 'PLAN': ['WEEKLY MEETING SCHEDULE', 'MONTHLY BUDGET OVERVIEW'],
- 'GEO': ['MOUNT EVEREST BASE CAMP', 'THE GREAT BARRIER REEF'],
- 'GEAR': ['PROFESSIONAL CAMERA EQUIPMENT', 'OUTDOOR HIKING GEAR'],
- 'EMOJI': ['📅', '⏰'],
- 'BEHAVIOR': ['PUNCTUALITY', 'HONESTY'],
- 'TONE': ['CONFIDENTIAL', 'SATIRICAL'],
- 'LOCATION': ['CENTRAL PARK', 'DOWNTOWN LIBRARY']
-}}
-
-################
-Output:
-{{
-  "answer_type_keywords": ["DATE AND TIME", "ORGANIZATION", "PLAN"],
-  "entities_from_query": ["SpaceX", "Rocket launch", "Aerospace", "Power Recovery"]
-
-}}
-#############################
-Example 3:
-
-Query: "What is the role of education in reducing poverty?"
-Answer type pool: {{
- 'PERSONAL LIFE': ['MANAGING WORK-LIFE BALANCE', 'HOME IMPROVEMENT PROJECTS'],
- 'STRATEGY': ['MARKETING STRATEGIES FOR Q4', 'EXPANDING INTO NEW MARKETS'],
- 'SERVICE FACILITATION': ['CUSTOMER SATISFACTION SURVEYS', 'STAFF RETENTION PROGRAMS'],
- 'PERSON': ['ALBERT EINSTEIN', 'MARIA CALLAS'],
- 'FOOD': ['PAN-FRIED STEAK', 'POACHED EGGS'],
- 'EMOTION': ['OVERWHELM', 'CONTENTMENT'],
- 'PERSONAL EXPERIENCE': ['LIVING ABROAD', 'STARTING A NEW JOB'],
- 'INTERACTION': ['SOCIAL MEDIA ENGAGEMENT', 'PUBLIC SPEAKING'],
- 'BEVERAGE': ['CAPPUCCINO', 'MATCHA LATTE'],
- 'PLAN': ['ANNUAL FITNESS GOALS', 'QUARTERLY BUSINESS REVIEW'],
- 'GEO': ['THE AMAZON RAINFOREST', 'THE GRAND CANYON'],
- 'GEAR': ['SURFING ESSENTIALS', 'CYCLING ACCESSORIES'],
- 'EMOJI': ['💻', '📱'],
- 'BEHAVIOR': ['TEAMWORK', 'LEADERSHIP'],
- 'TONE': ['FORMAL MEETING', 'CASUAL CONVERSATION'],
- 'LOCATION': ['URBAN CITY CENTER', 'RURAL COUNTRYSIDE']
+问题: "SpaceX 的第一次火箭发射是什么时候？"
+答案类型池: {{
+ '日期时间': ['2023-10-10 10:00', '今天下午'],
+ '组织': ['全球倡议公司', '本地社区中心'],
+ '个人生活': ['日常锻炼计划', '家庭度假安排'],
+ '策略': ['新品发布', '年终促销'],
+ '服务支持': ['远程 IT 支持', '现场培训'],
+ '人物': ['亚历山大·汉密尔顿', '居里夫人'],
+ '食物': ['烤三文鱼', '素食卷饼'],
+ '情绪': ['兴奋', '失望'],
+ '个人经历': ['生日庆祝', '第一次马拉松'],
+ '互动': ['办公室闲聊', '论坛辩论'],
+ '饮品': ['冰咖啡', '绿色奶昔'],
+ '计划': ['周会安排', '月度预算概览'],
+ '地理': ['珠峰大本营', '大堡礁'],
+ '装备': ['专业摄影设备', '户外徒步装备'],
+ '表情符号': ['火箭表情', '铃铛表情'],
+ '行为': ['守时', '诚实'],
+ '语气': ['机密', '讽刺'],
+ '地点': ['中央公园', '市中心图书馆']
 }}
 
 ################
-Output:
+输出:
 {{
-  "answer_type_keywords": ["STRATEGY", "PERSON"],
-  "entities_from_query": ["School access", "Literacy rates", "Job training", "Income inequality"]
+  "answer_type_keywords": ["日期时间", "组织", "计划"],
+  "entities_from_query": ["SpaceX", "火箭发射", "航天", "动力回收"]
+
 }}
 #############################
-Example 4:
+示例 3：
 
-Query: "Where is the capital of the United States?"
-Answer type pool: {{
- 'ORGANIZATION': ['GREENPEACE', 'RED CROSS'],
- 'PERSONAL LIFE': ['DAILY WORKOUT', 'HOME COOKING'],
- 'STRATEGY': ['FINANCIAL INVESTMENT', 'BUSINESS EXPANSION'],
- 'SERVICE FACILITATION': ['ONLINE SUPPORT', 'CUSTOMER SERVICE TRAINING'],
- 'PERSON': ['ALBERTA SMITH', 'BENJAMIN JONES'],
- 'FOOD': ['PASTA CARBONARA', 'SUSHI PLATTER'],
- 'EMOTION': ['HAPPINESS', 'SADNESS'],
- 'PERSONAL EXPERIENCE': ['TRAVEL ADVENTURE', 'BOOK CLUB'],
- 'INTERACTION': ['TEAM BUILDING', 'NETWORKING MEETUP'],
- 'BEVERAGE': ['LATTE', 'GREEN TEA'],
- 'PLAN': ['WEIGHT LOSS', 'CAREER DEVELOPMENT'],
- 'GEO': ['PARIS', 'NEW YORK'],
- 'GEAR': ['CAMERA', 'HEADPHONES'],
- 'EMOJI': ['🏢', '🌍'],
- 'BEHAVIOR': ['POSITIVE THINKING', 'STRESS MANAGEMENT'],
- 'TONE': ['FRIENDLY', 'PROFESSIONAL'],
- 'LOCATION': ['DOWNTOWN', 'SUBURBS']
+问题: "教育在减少贫困中起什么作用？"
+答案类型池: {{
+ '个人生活': ['平衡工作与生活', '家庭改造项目'],
+ '策略': ['第四季度营销策略', '拓展新市场'],
+ '服务支持': ['客户满意度调查', '员工留存计划'],
+ '人物': ['爱因斯坦', '玛丽亚·卡拉斯'],
+ '食物': ['香煎牛排', '水波蛋'],
+ '情绪': ['不堪重负', '满足'],
+ '个人经历': ['海外生活', '开始新工作'],
+ '互动': ['社交媒体互动', '公开演讲'],
+ '饮品': ['卡布奇诺', '抹茶拿铁'],
+ '计划': ['年度健身目标', '季度业务回顾'],
+ '地理': ['亚马逊雨林', '大峡谷'],
+ '装备': ['冲浪必需品', '骑行配件'],
+ '表情符号': ['书本表情', '学位帽表情'],
+ '行为': ['团队合作', '领导力'],
+ '语气': ['正式会议', '轻松对话'],
+ '地点': ['城市中心', '乡村地区']
+}}
+
+################
+输出:
+{{
+  "answer_type_keywords": ["策略", "人物"],
+  "entities_from_query": ["入学机会", "识字率", "职业培训", "收入不平等"]
+}}
+#############################
+示例 4：
+
+问题: "美国的首都在哪里？"
+答案类型池: {{
+ '组织': ['绿色和平', '红十字会'],
+ '个人生活': ['日常锻炼', '居家烹饪'],
+ '策略': ['金融投资', '业务扩张'],
+ '服务支持': ['在线支持', '客服培训'],
+ '人物': ['艾伯塔·史密斯', '本杰明·琼斯'],
+ '食物': ['卡邦尼意面', '寿司拼盘'],
+ '情绪': ['快乐', '悲伤'],
+ '个人经历': ['旅行冒险', '读书会'],
+ '互动': ['团队建设', '社交聚会'],
+ '饮品': ['拿铁', '绿茶'],
+ '计划': ['减重', '职业发展'],
+ '地理': ['巴黎', '纽约'],
+ '装备': ['相机', '耳机'],
+ '表情符号': ['地图表情', '建筑表情'],
+ '行为': ['积极思考', '压力管理'],
+ '语气': ['友好', '专业'],
+ '地点': ['市中心', '郊区']
 }}
 ################
-Output:
+输出:
 {{
-  "answer_type_keywords": ["LOCATION"],
-  "entities_from_query": ["capital of the United States", "Washington", "New York"]
+  "answer_type_keywords": ["地点"],
+  "entities_from_query": ["美国首都", "华盛顿", "纽约"]
 }}
 #############################
 
--Real Data-
+-真实数据-
 ######################
-Query: {query}
-Answer type pool:{TYPE_POOL}
+问题: {query}
+答案类型池:{TYPE_POOL}
 ######################
-Output:
+输出:
 
 """
 
-PROMPTS["keywords_extraction"] = """---Role---
+PROMPTS["keywords_extraction"] = """---角色---
 
-You are a helpful assistant tasked with identifying both high-level and low-level keywords in the user's query.
+你是一名有帮助的助手，任务是识别用户问题中的高层关键词和底层关键词。
 
----Goal---
+---目标---
 
-Given the query, list both high-level and low-level keywords. High-level keywords focus on overarching concepts or themes, while low-level keywords focus on specific entities, details, or concrete terms.
+给定一个问题，请列出高层关键词和底层关键词。高层关键词关注整体概念或主题，底层关键词关注具体实体、细节或明确术语。
 
----Instructions---
+---说明---
 
-- Output the keywords in JSON format.
-- The JSON should have two keys:
-  - "high_level_keywords" for overarching concepts or themes.
-  - "low_level_keywords" for specific entities or details.
+- 以 JSON 格式输出关键词。
+- JSON 中应包含两个键：
+  - "high_level_keywords"：表示整体概念或主题。
+  - "low_level_keywords"：表示具体实体或细节。
 
 ######################
--Examples-
+-示例-
 ######################
 {examples}
 
 #############################
--Real Data-
+-真实数据-
 ######################
-Query: {query}
+问题: {query}
 ######################
-The `Output` should be human text, not unicode characters. Keep the same language as `Query`.
-Output:
+`Output` 应为正常人类可读文本，不要输出 unicode 转义字符。保持与 `Query` 相同的语言。
+输出:
 
 """
 
 PROMPTS["keywords_extraction_examples"] = [
-    """Example 1:
+    """示例 1：
 
-Query: "How does international trade influence global economic stability?"
+问题: "国际贸易如何影响全球经济稳定？"
 ################
-Output:
+输出:
 {
-  "high_level_keywords": ["International trade", "Global economic stability", "Economic impact"],
-  "low_level_keywords": ["Trade agreements", "Tariffs", "Currency exchange", "Imports", "Exports"]
+  "high_level_keywords": ["国际贸易", "全球经济稳定", "经济影响"],
+  "low_level_keywords": ["贸易协定", "关税", "汇率", "进口", "出口"]
 }
 #############################""",
-    """Example 2:
+    """示例 2：
 
-Query: "What are the environmental consequences of deforestation on biodiversity?"
+问题: "森林砍伐对生物多样性会造成哪些环境后果？"
 ################
-Output:
+输出:
 {
-  "high_level_keywords": ["Environmental consequences", "Deforestation", "Biodiversity loss"],
-  "low_level_keywords": ["Species extinction", "Habitat destruction", "Carbon emissions", "Rainforest", "Ecosystem"]
+  "high_level_keywords": ["环境后果", "森林砍伐", "生物多样性丧失"],
+  "low_level_keywords": ["物种灭绝", "栖息地破坏", "碳排放", "雨林", "生态系统"]
 }
 #############################""",
-    """Example 3:
+    """示例 3：
 
-Query: "What is the role of education in reducing poverty?"
+问题: "教育在减少贫困中起什么作用？"
 ################
-Output:
+输出:
 {
-  "high_level_keywords": ["Education", "Poverty reduction", "Socioeconomic development"],
-  "low_level_keywords": ["School access", "Literacy rates", "Job training", "Income inequality"]
+  "high_level_keywords": ["教育", "减少贫困", "社会经济发展"],
+  "low_level_keywords": ["入学机会", "识字率", "职业培训", "收入不平等"]
 }
 #############################""",
 ]

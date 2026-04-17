@@ -373,86 +373,137 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
         - Previous task chunks may be reused if available
     """
 
+    # 生成一个基础解析任务骨架，后面会按文档类型补 from_page/to_page 等信息。
     def new_task():
         return {
+            # 任务唯一 ID。
             "id": get_uuid(),
+            # 任务所属文档 ID。
             "doc_id": doc["id"],
+            # 初始进度为 0。
             "progress": 0.0,
+            # 默认起始页/起始行，从 0 开始。
             "from_page": 0,
+            # 默认结束页给一个很大的值，后面通常会按具体文档类型覆盖。
             "to_page": 100000000,
+            # 记录任务创建时间。
             "begin_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+    # parse_task_array 保存当前文档最终要入库和入队的所有解析任务。
     parse_task_array = []
 
+    # PDF 文档：按页范围拆分成多个解析任务。
     if doc["type"] == FileType.PDF.value:
+        # 从对象存储中取回 PDF 原始二进制。
         file_bin = settings.STORAGE_IMPL.get(bucket, name)
+        # 读取布局识别配置；不同布局模式会影响任务拆分粒度。
         do_layout = doc["parser_config"].get("layout_recognize", "DeepDOC")
+        # 统计 PDF 总页数。
         pages = PdfParser.total_page_number(doc["name"], file_bin)
+        # 页数统计失败时按 0 页兜底，避免后续 range 报错。
         if pages is None:
             pages = 0
+        # 默认每个任务处理多少页，可由 parser_config 覆盖。
         page_size = doc["parser_config"].get("task_page_size") or 12
+        # `paper` 解析器默认任务页数更大。
         if doc["parser_id"] == "paper":
             page_size = doc["parser_config"].get("task_page_size") or 22
+        # 某些解析器或配置不适合细粒度分页任务，此时直接把整段页范围合并成一个大任务。
         if doc["parser_id"] in ["one", "knowledge_graph"] or do_layout != "DeepDOC" or doc["parser_config"].get("toc_extraction", False):
             page_size = 10 ** 9
+        # 支持按 parser_config 指定只处理部分页码区间；默认处理全量页。
         page_ranges = doc["parser_config"].get("pages") or [(1, 10 ** 5)]
+        # 逐个页范围生成解析任务。
         for s, e in page_ranges:
+            # 把用户配置的 1-based 页码转成内部 0-based 起始页。
             s -= 1
+            # 起始页至少为 0。
             s = max(0, s)
+            # 结束页不能超过 PDF 实际总页数。
             e = min(e - 1, pages)
+            # 按 page_size 把页范围切成多个子任务。
             for p in range(s, e, page_size):
                 task = new_task()
+                # 当前子任务起始页。
                 task["from_page"] = p
+                # 当前子任务结束页，上限不超过原始结束页。
                 task["to_page"] = min(p + page_size, e)
                 parse_task_array.append(task)
 
+    # 表格解析器：按行范围拆任务，而不是按页。
     elif doc["parser_id"] == "table":
+        # 从对象存储取回原始表格文件。
         file_bin = settings.STORAGE_IMPL.get(bucket, name)
+        # 统计 Excel/表格总行数。
         rn = RAGFlowExcelParser.row_number(doc["name"], file_bin)
+        # 每 3000 行切一个任务。
         for i in range(0, rn, 3000):
             task = new_task()
+            # 起始行号。
             task["from_page"] = i
+            # 结束行号。
             task["to_page"] = min(i + 3000, rn)
             parse_task_array.append(task)
     else:
+        # 其他文档类型默认只创建一个整体解析任务。
         parse_task_array.append(new_task())
 
+    # 获取该文档当前的切块配置，用于生成任务 digest 和复用旧结果。
     chunking_config = DocumentService.get_chunking_config(doc["id"])
+    # 为每个任务计算 digest，并补充优先级等公共字段。
     for task in parse_task_array:
+        # 用 xxhash 生成轻量级稳定摘要。
         hasher = xxhash.xxh64()
+        # 先把 chunking 配置编码进 digest，确保配置变化时不会复用旧任务。
         for field in sorted(chunking_config.keys()):
             if field == "parser_config":
+                # raptor / graphrag 不参与普通解析任务复用判断，避免这些派生流程影响 digest。
                 for k in ["raptor", "graphrag"]:
                     if k in chunking_config[field]:
                         del chunking_config[field][k]
             hasher.update(str(chunking_config[field]).encode("utf-8"))
+        # 再把任务自己的关键范围信息编码进 digest。
         for field in ["doc_id", "from_page", "to_page"]:
             hasher.update(str(task.get(field, "")).encode("utf-8"))
+        # 生成当前任务的唯一摘要。
         task_digest = hasher.hexdigest()
         task["digest"] = task_digest
+        # 显式重置进度。
         task["progress"] = 0.0
+        # 写入任务优先级，供后续按不同队列消费。
         task["priority"] = priority
 
+    # 查询这个文档历史上已有的任务记录，尝试做 chunk 复用优化。
     prev_tasks = TaskService.get_tasks(doc["id"])
+    # ck_num 统计这次可直接复用的 chunk 数量。
     ck_num = 0
     if prev_tasks:
+        # 逐个新任务尝试复用历史任务产生的 chunk。
         for task in parse_task_array:
             ck_num += reuse_prev_task_chunks(task, prev_tasks, chunking_config)
+        # 无论是否复用，旧任务记录都清掉，后续只保留这次的新任务。
         TaskService.filter_delete([Task.doc_id == doc["id"]])
+        # 收集历史任务产生的 chunk_id，后面从 docStore 里删掉旧 chunk。
         pre_chunk_ids = []
         for pre_task in prev_tasks:
             if pre_task["chunk_ids"]:
                 pre_chunk_ids.extend(pre_task["chunk_ids"].split())
+        # 如果历史任务确实有 chunk，就先从底层索引删掉，避免新旧结果混杂。
         if pre_chunk_ids:
             settings.docStoreConn.delete({"id": pre_chunk_ids}, search.index_name(chunking_config["tenant_id"]),
                                          chunking_config["kb_id"])
+    # 把当前文档的 chunk_num 先更新为“已复用的 chunk 数”。
     DocumentService.update_by_id(doc["id"], {"chunk_num": ck_num})
 
+    # 批量把新任务插入数据库。
     bulk_insert_into_db(Task, parse_task_array, True)
+    # 把文档状态更新为“开始解析/已入队”。
     DocumentService.begin2parse(doc["id"])
 
+    # 只把尚未完成的任务推入 Redis 队列；已复用完成的任务不需要再次执行。
     unfinished_task_array = [task for task in parse_task_array if task["progress"] < 1.0]
+    # 逐个投递到对应优先级的服务队列中。
     for unfinished_task in unfinished_task_array:
         assert REDIS_CONN.queue_product(
             settings.get_svr_queue_name(priority), message=unfinished_task

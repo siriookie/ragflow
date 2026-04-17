@@ -430,20 +430,32 @@ class FileService(CommonService):
     @classmethod
     @DB.connection_context()
     def upload_document(self, kb, file_objs, user_id, src="local", parent_path: str | None = None):
+        # 获取当前用户的根目录。
         root_folder = self.get_root_folder(user_id)
+        # 根目录 ID，后面初始化知识库文档目录时会用到。
         pf_id = root_folder["id"]
+        # 确保用户的知识库文档目录存在。
         self.init_knowledgebase_docs(pf_id, user_id)
+        # 获取知识库文件根目录。
         kb_root_folder = self.get_kb_folder(user_id)
+        # 确保当前知识库在文件树里有对应文件夹节点。
         kb_folder = self.new_a_file_from_kb(kb.tenant_id, kb.name, kb_root_folder["id"])
 
+        # 清洗父路径，避免路径穿越或非法路径片段。
         safe_parent_path = sanitize_path(parent_path)
 
+        # err 收集失败信息；files 收集成功结果，每项为 (doc, blob)。
         err, files = [], []
+        # 逐个处理上传的文件对象。
         for file in file_objs:
+            # 如果上传对象自带 id（例如某些重传/同步场景），就复用；否则生成新文档 ID。
             doc_id = file.id if hasattr(file, "id") else get_uuid()
+            # 先检查这个文档 ID 是否已存在。
             e, doc = DocumentService.get_by_id(doc_id)
+            # 如果文档已存在，走“更新已有文档”路径。
             if e:
                 try:
+                    # 已存在文档但属于别的知识库时，拒绝更新，避免跨知识库误覆盖。
                     if str(doc.kb_id) != str(kb.id):
                         logging.warning(
                             "Existing document id collision detected for %s: belongs to kb_id=%s, incoming kb_id=%s. "
@@ -455,43 +467,68 @@ class FileService(CommonService):
                         user_msg = "Existing document id collision with another knowledge base; skipping update."
                         err.append(file.filename + ": " + user_msg)
                         continue
+                    # 读取新文件内容。
                     blob = file.read()
+                    # 计算新内容哈希，用于判断内容是否真的发生变化。
                     new_hash = xxhash.xxh128(blob).hexdigest()
+                    # 取旧内容哈希；若历史没有记录则用空字符串兜底。
                     old_hash = doc.content_hash or ""
+                    # 用原 location 覆盖写回对象存储。
                     settings.STORAGE_IMPL.put(kb.id, doc.location, blob, kb.tenant_id)
+                    # 更新文档大小。
                     doc.size = len(blob)
+                    # 更新文档内容哈希。
                     doc.content_hash = new_hash
+                    # 转成 dict 供 update_by_id 使用。
                     doc = doc.to_dict()
+                    # 把新的 size/hash 等信息持久化到数据库。
                     DocumentService.update_by_id(doc["id"], doc)
+                    # 只有内容哈希真的变了，才把它记入成功列表，供后续重新解析。
                     if new_hash != old_hash:
                         files.append((doc, blob))
                 except Exception as exc:
+                    # 更新失败时记录异常并把错误信息返回给调用方。
                     logging.exception(f"Failed to update document {doc_id}: {exc}")
                     err.append(file.filename + ": " + str(exc))
+                # 已存在文档处理完后，不再走“新增文档”逻辑。
                 continue
+            # 文档不存在时，走“新增文档”路径。
             try:
+                # 做文件健康检查，例如危险文件名或其他上传前校验。
                 DocumentService.check_doc_health(kb.tenant_id, file.filename)
+                # 若知识库内已有重名文档，则自动改名避免冲突。
                 filename = duplicate_name(DocumentService.query, name=file.filename, kb_id=kb.id)
+                # 根据文件名识别文件类型。
                 filetype = filename_type(filename)
+                # 不支持的文件类型直接拒绝。
                 if filetype == FileType.OTHER.value:
                     raise RuntimeError("This type of file has not been supported yet!")
 
+                # 计算对象存储中的目标路径；如果指定了父路径，则放到该子目录下。
                 location = filename if not safe_parent_path else f"{safe_parent_path}/{filename}"
+                # 如果对象存储里已存在相同路径，就不断追加 "_" 直到唯一。
                 while settings.STORAGE_IMPL.obj_exist(kb.id, location):
                     location += "_"
 
+                # 读取文件二进制内容。
                 blob = file.read()
+                # PDF 可能带有损坏结构，先做一次兼容修复再存储。
                 if filetype == FileType.PDF.value:
                     blob = read_potential_broken_pdf(blob)
+                # 把文件正文写入对象存储。
                 settings.STORAGE_IMPL.put(kb.id, location, blob)
 
 
+                # 生成缩略图二进制（如果该文件类型支持）。
                 img = thumbnail_img(filename, blob)
+                # 默认没有缩略图存储位置。
                 thumbnail_location = ""
+                # 如果成功生成缩略图，就单独存一份缩略图对象。
                 if img is not None:
                     thumbnail_location = f"thumbnail_{doc_id}.png"
                     settings.STORAGE_IMPL.put(kb.id, thumbnail_location, img)
 
+                # 组装待入库的文档记录。
                 doc = {
                     "id": doc_id,
                     "kb_id": kb.id,
@@ -508,13 +545,18 @@ class FileService(CommonService):
                     "thumbnail": thumbnail_location,
                     "content_hash": xxhash.xxh128(blob).hexdigest(),
                 }
+                # 把文档元信息插入数据库。
                 DocumentService.insert(doc)
 
+                # 把文档挂接到知识库文件夹树中。
                 FileService.add_file_from_kb(doc, kb_folder["id"], kb.tenant_id)
+                # 记录成功上传的 (doc, blob)，供上层返回和后续解析使用。
                 files.append((doc, blob))
             except Exception as e:
+                # 新增失败时，把文件名和错误原因加入错误列表。
                 err.append(file.filename + ": " + str(e))
 
+        # 返回错误列表和成功文件列表。
         return err, files
 
     @classmethod

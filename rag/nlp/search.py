@@ -727,10 +727,126 @@ class Dealer:
         tag_fea = sorted([(a, round(0.1 * (c + 1) / (cnt + S) / max(1e-6, all_tags.get(a, 0.0001)))) for a, c in aggs],
                          key=lambda x: x[1] * -1)[:topn_tags]
         return {a.replace(".", "_"): max(1, c) for a, c in tag_fea}
-
+    # retrieval_by_toc 的作用是：
+    #
+    # 在“第一轮已经召回到一些 chunk”之后，利用文档的目录结构 TOC，再补召回或重排一批更相关的 chunk，让结果更贴近“用户真正关心的章节”。
+    #
+    # 定义在 search.py (line 731)，调用入口之一在 dialog_service.py (line 789)。
+    #
+    # 它解决的核心问题
+    # 普通向量检索有时只能命中零散段落，但用户的问题其实是针对某个“章节主题”。
+    # 这时如果文档提前抽出了 TOC，系统就可以：
+    #
+    # 先看第一轮召回最像哪篇文档
+    # 再读这篇文档的目录
+    # 让大模型判断目录里哪些章节和问题最相关
+    # 把这些章节对应的 chunk 补进结果，或给已有 chunk 加分
+    # 最后重新排序，返回更完整、更成体系的内容
+    # 你可以把它理解成“目录增强检索”。
+    #
+    # 它大致怎么做
+    # 结合 search.py (line 731) 这段实现，流程是：
+    #
+    # 输入当前已经召回的 chunks
+    # 这些通常是第一轮向量/关键词检索得到的候选结果。
+    #
+    # 按文档累计分数
+    # 函数会把同一篇文档下多个命中 chunk 的 similarity 累加，选出当前“最相关的那篇文档”。
+    # 关键位置在 search.py (line 753)。
+    #
+    # 读取这篇文档的 TOC chunk
+    # 系统会去索引里找这篇文档的目录数据，目录是特殊 chunk，用 toc_kwd == "toc" 标记。
+    #
+    # 让 LLM 根据“问题 + 目录”挑相关章节
+    # 这里调用了 relevant_chunks_with_toc(...)，返回一批目录推荐的 chunk id 和相似度分数。
+    # 关键位置在 search.py (line 779)。
+    #
+    # 对已有结果加分，或把新 chunk 补进来
+    # 如果目录挑中的 chunk 本来就在结果里，就提高它的分数。
+    # 如果不在，就去底层索引把它取回来，补进结果集。
+    #
+    # 重新排序，只保留 topn
+    # 最终按更新后的 similarity 排序返回。
+    # 关键位置在 search.py (line 831)。
+    #
+    # 举个直观例子
+    #
+    # 假设一份技术文档的目录是：
+    #
+    # 1. 产品概述
+    # 2. 安装部署
+    # 3. 鉴权机制
+    # 4. 向量检索流程
+    # 5. 常见故障排查
+    # 用户问：
+    #
+    # 向量检索为什么召回不稳定？
+    # 第一轮普通检索，可能召回到这些 chunk：
+    #
+    # chunk A: “召回率受 embedding 模型影响”
+    # chunk B: “索引刷新会影响查询结果”
+    # chunk C: “向量维度配置说明”
+    # 这些 chunk 可能来自同一篇文档，但比较碎。
+    #
+    # 这时 retrieval_by_toc 会做的事是：
+    #
+    # 发现这些 chunk 大多来自同一篇文档
+    # 读取这篇文档的目录
+    # 让模型判断最相关章节是“4. 向量检索流程”和“5. 常见故障排查”
+    # 找到这两个目录章节对应的 chunk id
+    # 把这些 chunk 补回结果集
+    # 于是最后返回给生成模型的上下文，可能变成：
+    #
+    # 原来命中的 A/B/C
+    # 新补进的 D: “向量检索流程总览”
+    # 新补进的 E: “召回不稳定的常见原因”
+    # 新补进的 F: “embedding、chunk 切分、topk 配置的影响”
+    # 这样回答就更容易从“单段命中”升级成“章节级理解”。
+    #
+    # 再举一个业务文档例子
+    #
+    # 文档目录：
+    #
+    # 1. 合同总则
+    # 2. 付款条款
+    # 3. 违约责任
+    # 4. 保密条款
+    # 用户问：
+    #
+    # 这个合同逾期付款怎么处理？
+    # 普通检索可能只打到一句“逾期按日计息”。
+    # 但 retrieval_by_toc 会意识到这个问题更可能属于“付款条款”和“违约责任”两章，于是把这两个章节的 chunk 一并召回，最终答案就不只是一句话，而是能把：
+    #
+    # 付款时间
+    # 逾期定义
+    # 违约责任
+    # 利息或罚则
+    # 一起交代出来。
+    #
+    # 它和普通检索的区别
+    #
+    # 普通检索：
+    # 直接按 chunk 文本相似度找片段。
+    #
+    # retrieval_by_toc：
+    # 先用普通检索找候选，再借助目录判断“应该展开看哪一章”。
+    #
+    # 所以它更像“二阶段增强”，不是替代第一轮检索。
+    #
+    # 适合什么场景
+    #
+    # 它特别适合：
+    #
+    # 长文档
+    # 章节结构清晰的 PDF / 手册 / 合同 / 规范文档
+    # 用户问题更偏“主题”而不是精确句子匹配
+    # 希望召回结果更完整、更成块
+    # 也有一个限制：
+    # 它只会围绕“当前得分最高的那篇文档”做 TOC 增强，不会同时对很多篇文档都展开，所以它本质上偏向“在最相关主文档内部做纵深补召回”。
     async def retrieval_by_toc(self, query: str, chunks: list[dict], tenant_ids: list[str], chat_mdl, topn: int = 6):
         # 延迟导入目录增强相关逻辑，避免模块加载阶段产生循环依赖。
-        from rag.prompts.generator import relevant_chunks_with_toc # moved from the top of the file to avoid circular import
+        from rag.prompts.generator import \
+            relevant_chunks_with_toc  # moved from the top of the file to avoid circular import
         # 没有任何候选 chunk 时，目录增强没有对象可扩展，直接返回空。
         if not chunks:
             return []
@@ -755,6 +871,58 @@ class Dealer:
         kb_ids = [doc_id2kb_id[doc_id]]
         # 去索引里查这个文档对应的目录 chunk。
         # 目录 chunk 通过 toc_kwd == "toc" 标识，核心内容放在 content_with_weight 里。
+        # TOC chunk 就是“目录块”。
+        #
+        # 在 RAGFlow 里，它不是普通正文 chunk，而是一种专门存“文档目录结构”的特殊 chunk，用来做目录增强检索。
+        #
+        # 你可以把它理解成：
+        #
+        # 普通 chunk：存正文内容
+        # TOC chunk：存这篇文档有哪些章节、每个章节对应哪些 chunk
+        # 从代码看，retrieval_by_toc 会专门查 toc_kwd == "toc" 的记录来拿目录信息，位置在 search.py (line 756)。
+        #
+        # 它里面通常放的不是自然段正文，而是类似这种结构化目录数据：
+        #
+        # [
+        #   {"title": "1. 产品概述", "ids": ["chunk_1", "chunk_2"]},
+        #   {"title": "2. 安装部署", "ids": ["chunk_3", "chunk_4", "chunk_5"]},
+        #   {"title": "3. 常见问题", "ids": ["chunk_6", "chunk_7"]}
+        # ]
+        # 意思是：
+        #
+        # 目录项 “产品概述” 对应哪些正文 chunk
+        # 目录项 “安装部署” 对应哪些正文 chunk
+        # 后续如果用户问题更像“安装部署”，系统就能直接把 chunk_3~5 补召回回来
+        # 它是怎么来的
+        # 在抽取流程里，系统会从文档内容里生成 TOC，然后把 TOC 单独存成一个 chunk。
+        # 相关逻辑在 extractor.py (line 40) 和 extractor.py (line 62)。
+        #
+        # 那里做的事情大致是：
+        #
+        # 从一批正文 chunk 提取目录
+        # 给每个目录项挂上对应的 chunk id 列表
+        # 把整份目录序列化后放进一个特殊 chunk 的 content_with_weight
+        # 再打上 toc_kwd = "toc" 标记
+        # 举个例子
+        #
+        # 假设一篇员工手册被切成这些正文 chunk：
+        #
+        # chunk_101: 公司介绍
+        # chunk_102: 企业文化
+        # chunk_103: 请假制度
+        # chunk_104: 病假流程
+        # chunk_105: 报销规范
+        # 那生成的 TOC chunk 可能是：
+        #
+        # [
+        #   {"title": "一、公司介绍", "ids": ["chunk_101", "chunk_102"]},
+        #   {"title": "二、请假制度", "ids": ["chunk_103", "chunk_104"]},
+        #   {"title": "三、报销规范", "ids": ["chunk_105"]}
+        # ]
+        # 如果用户问：
+        #
+        # 病假怎么申请？
+        # 系统先普通检索命中一点内容后，再看 TOC chunk，会发现“二、请假制度”最相关，于是把 chunk_103 和 chunk_104 一起补进来。
         es_res = self.dataStore.search(["content_with_weight"], [], {"doc_id": doc_id, "toc_kwd": "toc"}, [],
                                        OrderByExpr(), 0, 128, idx_nms,
                                        kb_ids)
@@ -829,51 +997,174 @@ class Dealer:
 
         # 最后按更新后的 similarity 重新排序，并只保留 topn 条结果。
         return sorted(chunks, key=lambda x: x["similarity"] * -1)[:topn]
-
+    # 检索阶段命中的多个“子块”合并提升成它们对应的“母块”，这样后续给模型的上下文会更完整，不只是一些碎片段。
+    #
+    # 它在 search.py (line 1001)。
+    #
+    # 它解决的问题
+    # 很多文档在切分时，会有这种结构：
+    #
+    # 一个较大的母块
+    # 母块下面再切成多个更细的 children chunk
+    # 检索时往往先命中的是细粒度子块
+    # 但回答问题时，单个子块上下文可能太碎
+    # 所以这个函数做的是：
+    #
+    # 找出命中的子块
+    # 按它们的 mom_id 分组
+    # 回查对应的母块正文
+    # 用这些子块的分数，生成一个新的母块候选
+    # 把这个母块放回结果集，再统一排序
+    # 你可以把它理解成：
+    #
+    # “子块负责召回精度，母块负责回答上下文完整性。”
+    #
+    # 它具体怎么做
+    #
+    # 看 search.py (line 1007) 往后这段逻辑：
+    #
+    # 遍历当前命中的 chunks
+    # 如果某个 chunk 有 mom_id，说明它只是某个母块下面的子块
+    # 把这些子块从原结果里移出去，并按 mom_id 分组
+    # 每组子块去存储层 get(id, ...) 查回对应母块
+    # 组装一个新的母块结果：
+    # content_with_weight 用母块完整正文
+    # similarity 用这一组子块相似度的均值
+    # important_kwd 合并所有子块关键词
+    # 把母块追加回候选结果
+    # 最后按相似度排序返回
+    # 举个简单例子
+    #
+    # 假设原始文档里有一个母块 M1，内容是整段“请假制度”，然后它被切成 3 个子块：
+    #
+    # C1: 年假规则，mom_id = M1
+    # C2: 病假流程，mom_id = M1
+    # C3: 事假审批，mom_id = M1
+    # 用户问：
+    #
+    # 病假怎么申请？
+    # 第一轮检索可能命中的是：
+    #
+    # C2 相似度 0.91
+    # C3 相似度 0.63
+    # 这时候如果直接把 C2 和 C3 丢给模型，虽然也能回答，但上下文还是碎的。
+    #
+    # retrieval_by_children 会做成这样：
+    #
+    # 发现 C2 和 C3 都有同一个 mom_id = M1
+    # 把它们归成一组
+    # 回查母块 M1
+    # 生成一个新的候选块：
+    # {
+    #     "chunk_id": "M1",
+    #     "content_with_weight": "整段请假制度全文",
+    #     "similarity": mean([0.91, 0.63])  # 约 0.77
+    # }
+    # 最后给模型的，不再只是零碎句子，而是整段“请假制度”的完整内容。
+    #
+    # 再举一个更像 PDF 的例子
+    #
+    # 一份技术手册里，一个章节母块是：
+    #
+    # M20: “4. 向量检索参数说明”
+    # 它下面有几个子块：
+    #
+    # C201: top_k 配置
+    # C202: similarity_threshold
+    # C203: rerank 策略
+    # 用户问：
+    #
+    # similarity_threshold 应该怎么设置？
+    # 第一轮检索很可能只命中 C202。
+    # 但真正回答这个问题时，往往还需要看到：
+    #
+    # 这个参数在整章里的上下文
+    # 它和 top_k、rerank 的关系
+    # 这一节前后说明
+    # 所以 retrieval_by_children 会把 C202 提升成 M20，让模型读到整章母块，而不是只读一句参数说明。
+    #
+    # 一句话总结
     def retrieval_by_children(self, chunks: list[dict], tenant_ids: list[str]):
+        # 如果没有任何候选 chunk，就没有子块可合并，直接返回空列表。
         if not chunks:
             return []
+        # 把 tenant_id 转换成底层索引名，后面回查父块时会用到。
         idx_nms = [index_name(tid) for tid in tenant_ids]
+        # mom_chunks 用来按父块 ID 分组保存所有命中的子块。
         mom_chunks = defaultdict(list)
+        # 用 while + pop 的方式原地扫描并移除带 mom_id 的子块。
         i = 0
+        # 遍历当前候选结果，找出哪些是“有父块”的子 chunk。
         while i < len(chunks):
+            # 取出当前位置的候选 chunk。
             ck = chunks[i]
+            # mom_id 表示当前 chunk 对应的父块 ID。
             mom_id = ck.get("mom_id")
+            # 如果没有合法的父块 ID，说明它本身就是普通块或父块，保留在原列表中继续向后扫描。
             if not isinstance(mom_id, str) or not mom_id.strip():
                 i += 1
                 continue
+            # 如果有父块 ID，就把该子块从原结果集中移出，并按 mom_id 归入对应父块分组。
             mom_chunks[ck["mom_id"]].append(chunks.pop(i))
 
+        # 如果最终一个需要提升为父块的分组都没有，说明输入里没有子块，直接返回原结果。
         if not mom_chunks:
             return chunks
 
+        # 理论上此时 chunks 里保留的是原本没有 mom_id 的候选块。
+        # 如果全被移走了，就显式重置为空列表，便于后面 append 父块结果。
         if not chunks:
             chunks = []
 
+        # 默认向量维度占位值；如果后面从子块里读到真实向量，会用真实维度覆盖。
         vector_size = 1024
+        # 逐个父块分组处理，把多个命中的子块合并成一个父块结果。
         for id, cks in mom_chunks.items():
+            # 从存储层按父块 ID 回查父块正文内容。
+            # kb_id 取该组子块所属知识库列表，兼容底层检索接口。
             chunk = self.dataStore.get(id, idx_nms[0], [ck["kb_id"] for ck in cks])
+            # 组装统一的返回结构，把多个子块的信号提升为一个父块候选。
             d = {
+                # 父块自己的 chunk_id。
                 "chunk_id": id,
+                # 把所有命中子块的分词文本拼起来，保留检索语义痕迹。
                 "content_ltks": " ".join([ck["content_ltks"] for ck in cks]),
+                # 父块的完整正文内容，作为后续生成阶段真正可用的上下文。
                 "content_with_weight": chunk["content_with_weight"],
+                # 父块所属文档 ID。
                 "doc_id": chunk["doc_id"],
+                # 文档名，缺省时给空字符串。
                 "docnm_kwd": chunk.get("docnm_kwd", ""),
+                # 父块所属知识库 ID。
                 "kb_id": chunk["kb_id"],
+                # 把所有子块的重要关键词合并起来，尽量保留原检索特征。
                 "important_kwd": [kwd for ck in cks for kwd in ck.get("important_kwd", [])],
+                # 父块关联的图片 ID。
                 "image_id": chunk.get("img_id", ""),
+                # 父块的综合分数用子块相似度均值表示，避免子块数多的父块天然占优。
                 "similarity": np.mean([ck["similarity"] for ck in cks]),
+                # 这里沿用同一份均值作为向量分和词项分，占位兼容上层统一结构。
                 "vector_similarity": np.mean([ck["similarity"] for ck in cks]),
                 "term_similarity": np.mean([ck["similarity"] for ck in cks]),
+                # 先放一个默认零向量，后面如发现真实向量字段再替换。
                 "vector": [0.0] * vector_size,
+                # 父块在原文中的位置坐标。
                 "positions": chunk.get("position_int", []),
+                # 文档类型字段，便于后续统一处理。
                 "doc_type_kwd": chunk.get("doc_type_kwd", "")
             }
+            # 尝试从第一个子块里继承真实向量字段。
+            # 这里只取第一条，是因为同组子块的向量格式通常一致。
             for k in cks[0].keys():
+                # 约定所有向量字段都以 _vec 结尾。
                 if k[-4:] == "_vec":
+                    # 用真实向量替换默认零向量。
                     d["vector"] = cks[0][k]
+                    # 同步记录真实向量维度，供后续父块继续复用。
                     vector_size = len(cks[0][k])
                     break
+            # 把合并后的父块结果追加回候选列表。
             chunks.append(d)
 
+        # 最后按相似度降序返回，保证父块提升后仍遵循统一排序规则。
         return sorted(chunks, key=lambda x: x["similarity"] * -1)

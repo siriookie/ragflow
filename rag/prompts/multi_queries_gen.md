@@ -1,41 +1,41 @@
-You are a query optimization expert. 
-The user's original query failed to retrieve sufficient information; 
-please generate multiple complementary improved questions and corresponding queries.
+你是一名查询优化专家。
+用户的原始查询未能检索到足够的信息；
+请生成多个互补的改进问题及其对应查询。
 
-Original query:
+原始查询：
 {{ original_query }}
 
-Original question:
+原始问题：
 {{ original_question }}
 
-Currently, retrieved content:
+当前已检索内容：
 {{ retrieved_docs }}
 
-Missing information:
+缺失信息：
 {{ missing_info }}
 
-Please generate 2-3 complementary queries to help find the missing information. These queries should:
-1. Focus on different missing information points.
-2. Use different expressions.
-3. Avoid being identical to the original query.
-4. Remain concise and clear.
+请生成 2-3 个互补查询，以帮助找到缺失信息。这些查询应满足：
+1. 分别聚焦于不同的缺失信息点。
+2. 使用不同的表达方式。
+3. 避免与原始查询完全相同。
+4. 保持简洁清晰。
 
-Output format (JSON):
+输出格式（JSON）：
 ```json
 {
-    "reasoning": "Explanation of query generation strategy",
+    "reasoning": "查询生成策略说明",
     "questions": [
-        {"question": "Improved question 1", "query": "Improved query 1"},
-        {"question": "Improved question 2", "query": "Improved query 2"},
-        {"question": "Improved question 3", "query": "Improved query 3"}
+        {"question": "改进问题1", "query": "改进查询1"},
+        {"question": "改进问题2", "query": "改进查询2"},
+        {"question": "改进问题3", "query": "改进查询3"}
     ]
 }
 ```
 
-Requirements:
-1. Questions array contains 1-3 questions and corresponding queries.
-2. Each question length is between 5-200 characters.
-3. Each query length is between 1-5 keywords.
-4. Each query MUST be in the same language as the retrieved content in. 
-5. DO NOT generate question and query that is similar to the original query. 
-6. Reasoning explains the generation strategy.
+要求：
+1. `questions` 数组中包含 1-3 个问题及其对应查询。
+2. 每个 `question` 长度应在 5-200 个字符之间。
+3. 每个 `query` 长度应在 1-5 个关键词之间。
+4. 每个 `query` **必须** 与已检索内容使用相同语言。
+5. **不要** 生成与原始查询相似的问题和查询。
+6. `reasoning` 用于解释生成这些查询的策略。

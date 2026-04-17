@@ -116,13 +116,19 @@ class DocumentService(CommonService):
     @classmethod
     @DB.connection_context()
     def check_doc_health(cls, tenant_id: str, filename):
+        # 延迟导入 os，用于读取运行时环境变量配置。
         import os
 
+        # 从环境变量读取“每个用户最多允许上传多少文件”限制。
+        # 0 表示不限制。
         MAX_FILE_NUM_PER_USER = int(os.environ.get("MAX_FILE_NUM_PER_USER", 0))
+        # 如果配置了正数上限，并且当前租户文档数已经达到或超过上限，则拒绝继续上传。
         if 0 < MAX_FILE_NUM_PER_USER <= DocumentService.get_doc_count(tenant_id):
             raise RuntimeError("Exceed the maximum file number of a free user!")
+        # 文件名按 UTF-8 编码后的字节长度不能超过系统限制。
         if len(filename.encode("utf-8")) > FILE_NAME_LEN_LIMIT:
             raise RuntimeError("Exceed the maximum length of file name!")
+        # 所有检查通过时返回 True，表示可以继续上传流程。
         return True
 
     @classmethod
@@ -963,24 +969,37 @@ class DocumentService(CommonService):
 
     @classmethod
     def run(cls, tenant_id: str, doc: dict, kb_table_num_map: dict):
+        # 延迟导入任务调度函数，避免模块级循环依赖。
         from api.db.services.task_service import queue_dataflow, queue_tasks
+        # 延迟导入文件到文档映射服务，用于获取原始文件存储地址。
         from api.db.services.file2document_service import File2DocumentService
 
+        # 把租户 ID 写回文档字典，后续排任务时会用到。
         doc["tenant_id"] = tenant_id
+        # 读取文档解析器类型；如果没有显式配置，默认按 NAIVE 处理。
         doc_parser = doc.get("parser_id", ParserType.NAIVE)
+        # 如果是表格解析器，先处理知识库 field_map 的清理逻辑。
         if doc_parser == ParserType.TABLE:
+            # 表格文档一定要知道所属知识库，否则无法维护表结构映射。
             kb_id = doc.get("kb_id")
             if not kb_id:
                 return
+            # 同一个知识库批量 run 时，只统计一次该知识库已完成表格文档数。
             if kb_id not in kb_table_num_map:
+                # 统计该知识库当前 DONE 状态的文档数。
                 count = DocumentService.count_by_kb_id(kb_id=kb_id, keywords="", run_status=[TaskStatus.DONE], types=[])
                 kb_table_num_map[kb_id] = count
+                # 如果知识库里已经没有已完成文档，则删除旧的 field_map，避免脏表结构残留。
                 if kb_table_num_map[kb_id] <= 0:
                     KnowledgebaseService.delete_field_map(kb_id)
+        # 如果文档绑定了 pipeline_id，说明走数据流解析流程，而不是普通文件解析任务。
         if doc.get("pipeline_id", ""):
+            # 为该 pipeline 任务生成一个新的 task_id，并投递到 dataflow 队列。
             queue_dataflow(tenant_id, flow_id=doc["pipeline_id"], task_id=get_uuid(), doc_id=doc["id"])
         else:
+            # 普通文档解析时，先拿到原始文件所在的存储桶和对象名。
             bucket, name = File2DocumentService.get_storage_address(doc_id=doc["id"])
+            # 把文档解析任务投递到普通任务队列，优先级默认为 0。
             queue_tasks(doc, bucket, name, 0)
 
 

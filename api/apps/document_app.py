@@ -66,49 +66,72 @@ def _is_safe_download_filename(name: str) -> bool:
 @login_required
 @validate_request("kb_id")
 async def upload():
+    # 读取 multipart/form-data 里的表单字段。
     form = await request.form
+    # 取出目标知识库 ID。
     kb_id = form.get("kb_id")
+    # 没传 kb_id 时直接返回参数错误。
     if not kb_id:
         return get_json_result(data=False, message='Lack of "KB ID"', code=RetCode.ARGUMENT_ERROR)
+    # 读取上传的文件集合。
     files = await request.files
+    # 请求里没有 file 字段时，直接返回参数错误。
     if "file" not in files:
         return get_json_result(data=False, message="No file part!", code=RetCode.ARGUMENT_ERROR)
 
+    # 支持一次上传多个同名字段 `file`。
     file_objs = files.getlist("file")
 
+    # 统一关闭文件对象，避免在提前返回时留下未关闭句柄。
     def _close_file_objs(objs):
+        # 逐个尝试关闭文件对象。
         for obj in objs:
             try:
+                # 优先调用对象自己的 close。
                 obj.close()
             except Exception:
                 try:
+                    # 如果对象本身没有正常关闭，再退而求其次关闭底层流。
                     obj.stream.close()
                 except Exception:
+                    # 关闭失败时静默跳过，避免影响主错误返回。
                     pass
 
+    # 逐个校验上传文件是否合法。
     for file_obj in file_objs:
+        # 文件名为空，说明用户没有真正选择文件。
         if file_obj.filename == "":
             _close_file_objs(file_objs)
             return get_json_result(data=False, message="No file selected!", code=RetCode.ARGUMENT_ERROR)
+        # 文件名按 UTF-8 编码后的字节数不能超过系统限制。
         if len(file_obj.filename.encode("utf-8")) > FILE_NAME_LEN_LIMIT:
             _close_file_objs(file_objs)
             return get_json_result(data=False, message=f"File name must be {FILE_NAME_LEN_LIMIT} bytes or less.", code=RetCode.ARGUMENT_ERROR)
 
+    # 根据 kb_id 读取知识库对象。
     e, kb = KnowledgebaseService.get_by_id(kb_id)
+    # 知识库不存在时抛出异常，由上层统一处理。
     if not e:
         raise LookupError("Can't find this dataset!")
+    # 检查当前用户是否有该知识库的团队权限。
     if not check_kb_team_permission(kb, current_user.id):
         return get_json_result(data=False, message="No authorization.", code=RetCode.AUTHENTICATION_ERROR)
 
+    # 在线程池中执行文件上传逻辑，避免阻塞异步请求线程。
     err, files = await thread_pool_exec(FileService.upload_document, kb, file_objs, current_user.id)
+    # 如果上传过程中有错误，就把已成功处理的文件信息一并返回，便于前端部分展示。
     if err:
+        # FileService 返回的是 (doc, blob) 元组，这里只保留 doc 信息返回给前端。
         files = [f[0] for f in files] if files else []
         return get_json_result(data=files, message="\n".join(err), code=RetCode.SERVER_ERROR)
 
+    # 没报错但也没有成功文件，通常说明文件格式异常或内容损坏。
     if not files:
         return get_json_result(data=files, message="There seems to be an issue with your file format. Please verify it is correct and not corrupted.", code=RetCode.DATA_ERROR)
+    # 成功时同样去掉 blob，只把文档元信息返回给前端。
     files = [f[0] for f in files]  # remove the blob
 
+    # 返回上传成功后的文档列表。
     return get_json_result(data=files)
 
 
@@ -583,62 +606,95 @@ async def rm():
 @login_required
 @validate_request("doc_ids", "run")
 async def run():
+    # 读取前端传入的 JSON 请求体。
     req = await get_request_json()
+    # 当前登录用户 ID，后面做权限校验和操作归属判断。
     uid = current_user.id
     try:
 
+        # 把主要逻辑放到同步函数里，后面交给线程池执行，避免阻塞异步请求线程。
         def _run_sync():
+            # 先逐个检查文档访问权限，只要有一个文档无权操作就直接返回。
             for doc_id in req["doc_ids"]:
                 if not DocumentService.accessible(doc_id, uid):
                     return get_json_result(data=False, message="No authorization.", code=RetCode.AUTHENTICATION_ERROR)
 
+            # 用于在批量运行多个文档时缓存知识库表数量等信息，减少重复查询。
             kb_table_num_map = {}
+            # 逐个处理请求中的文档。
             for id in req["doc_ids"]:
+                # 初始化本次文档运行状态更新信息。
                 info = {"run": str(req["run"]), "progress": 0}
+                # 如果本次是“重新运行并删除旧结果”，则同时清空进度说明、chunk 数和 token 数。
                 if str(req["run"]) == TaskStatus.RUNNING.value and req.get("delete", False):
                     info["progress_msg"] = ""
                     info["chunk_num"] = 0
                     info["token_num"] = 0
 
+                # 获取文档所属租户 ID，后续删除向量库内容和启动解析任务都会用到。
                 tenant_id = DocumentService.get_tenant_id(id)
+                # 理论上文档必须能关联到租户，拿不到就直接返回数据错误。
                 if not tenant_id:
                     return get_data_error_result(message="Tenant not found!")
+                # 读取文档对象。
                 e, doc = DocumentService.get_by_id(id)
+                # 文档不存在则返回数据错误。
                 if not e:
                     return get_data_error_result(message="Document not found!")
 
+                # 如果本次请求是取消任务，则走取消逻辑。
                 if str(req["run"]) == TaskStatus.CANCEL.value:
+                    # 取出该文档下的所有任务记录。
                     tasks = list(TaskService.query(doc_id=id))
+                    # 只要存在未完成任务，就认为当前仍可取消。
                     has_unfinished_task = any((task.progress or 0) < 1 for task in tasks)
+                    # 文档状态本身是 RUNNING/CANCEL，或者存在未完成任务时，允许执行取消。
                     if str(doc.run) in [TaskStatus.RUNNING.value, TaskStatus.CANCEL.value] or has_unfinished_task:
                         cancel_all_task_of(id)
                     else:
+                        # 非运行态文档不允许取消，避免无效操作。
                         return get_data_error_result(message="Cannot cancel a task that is not in RUNNING status")
+                # 如果是“删除旧结果后重新运行”，并且文档之前已经完成过解析，
+                # 先把统计字段中的 chunk_num 清零，为重新入库做准备。
                 if all([("delete" not in req or req["delete"]), str(req["run"]) == TaskStatus.RUNNING.value, str(doc.run) == TaskStatus.DONE.value]):
                     DocumentService.clear_chunk_num_when_rerun(doc.id)
 
+                # 先把文档运行状态和进度更新到数据库。
                 DocumentService.update_by_id(id, info)
+                # 如果要求删除旧结果，则先清理旧任务记录和旧 chunk 数据。
                 if req.get("delete", False):
+                    # 删除该文档历史任务记录。
                     TaskService.filter_delete([Task.doc_id == id])
+                    # 如果底层向量/全文索引存在，则删掉该文档历史 chunk。
                     if settings.docStoreConn.index_exist(search.index_name(tenant_id), doc.kb_id):
                         settings.docStoreConn.delete({"doc_id": id}, search.index_name(tenant_id), doc.kb_id)
 
+                # 如果本次目标状态是 RUNNING，说明要正式启动解析任务。
                 if str(req["run"]) == TaskStatus.RUNNING.value:
+                    # 如果要求套用知识库级 parser 配置，就先把知识库上的配置同步到文档上。
                     if req.get("apply_kb"):
                         e, kb = KnowledgebaseService.get_by_id(doc.kb_id)
                         if not e:
                             raise LookupError("Can't find this dataset!")
+                        # 继承知识库配置中的 llm_id。
                         doc.parser_config["llm_id"] = kb.parser_config.get("llm_id")
+                        # 继承知识库配置中的 metadata 开关。
                         doc.parser_config["enable_metadata"] = kb.parser_config.get("enable_metadata", False)
+                        # 继承知识库配置中的 metadata 定义。
                         doc.parser_config["metadata"] = kb.parser_config.get("metadata", {})
+                        # 把同步后的 parser_config 持久化到文档。
                         DocumentService.update_parser_config(doc.id, doc.parser_config)
+                    # 转成 dict，交给下层 run 逻辑去排任务/跑解析。
                     doc_dict = doc.to_dict()
                     DocumentService.run(tenant_id, doc_dict, kb_table_num_map)
 
+            # 全部文档处理完成后返回成功结果。
             return get_json_result(data=True)
 
+        # 在线程池中执行同步逻辑。
         return await thread_pool_exec(_run_sync)
     except Exception as e:
+        # 任意异常走统一的服务端错误响应。
         return server_error_response(e)
 
 @manager.route("/get/<doc_id>", methods=["GET"])  # noqa: F821
