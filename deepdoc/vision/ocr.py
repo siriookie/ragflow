@@ -570,7 +570,6 @@ class OCR:
                     self.text_recognizer = [TextRecognizer(model_dir)]
 
             except Exception:
-                model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc",
                                               local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
                                               local_dir_use_symlinks=False)
                 
@@ -667,17 +666,41 @@ class OCR:
         return _boxes
 
     def detect(self, img, device_id: int | None = None):
+        # 如果调用方没有指定设备，就默认使用第 0 个 detector。
+        # OCR.__init__ 里会根据 settings.PARALLEL_DEVICES 创建多个 TextDetector，
+        # 所以这里的 device_id 本质上是在多设备/多实例场景下选择具体检测器。
         if device_id is None:
             device_id = 0
 
+        # 输入图像为空时直接返回 None。
+        # 这样上层可以把“没有可检测图像”和“检测不到文字框”统一当作空结果处理，
+        # 避免把 None 继续传进模型预处理导致异常。
         if img is None:
             return None
 
+        # 调用文本检测模型，只检测文字框，不做文字识别。
+        # 已读 TextDetector.__call__ 实现：
+        # 1. 先用 DetResizeForTest / NormalizeImage / ToCHWImage 等算子做图像预处理；
+        # 2. 调 ONNX predictor.run 得到文本区域概率图；
+        # 3. 用 DBPostProcess 从概率图里还原四点文本框；
+        # 4. filter_tag_det_res 会把点按顺时针规整、裁到图像边界内，并过滤宽高 <= 3 的噪声框。
+        # 这里暂时忽略第二个返回值耗时，因为当前 detect() 只负责把框交给上层。
         dt_boxes, _ = self.text_detector[device_id](img)
 
+        # 检测器没有返回任何框时直接返回 None。
+        # 上层 __ocr() 会据此给当前页追加空 boxes，保持页数对齐。
         if dt_boxes is None:
             return None
 
+        # 对检测框按阅读顺序排序后返回。
+        # 已读 sorted_boxes() 实现：先按左上角 y、x 排序，再把垂直距离小于 10 的框按 x 调整，
+        # 也就是尽量形成“从上到下、同一行从左到右”的顺序。
+        # 返回值故意伪造成 zip(box, ("", 0))：
+        # - box 是检测到的文本区域；
+        # - ("", 0) 是占位识别结果。
+        # 这样 detect() 可以只做检测，而保持返回结构和完整 OCR.__call__ 的“框 + 识别结果”形态兼容。
+        # 后续 pdf_parser.__ocr() 会优先用 PDF 原生文本填充这些框，
+        # 只有缺文本或乱码时才再裁图调用 recognize_batch()，这是成本和准确率之间的折中。
         return zip(self.sorted_boxes(dt_boxes), [
                    ("", 0) for _ in range(len(dt_boxes))])
 
@@ -694,15 +717,33 @@ class OCR:
         return text
 
     def recognize_batch(self, img_list, device_id: int | None = None):
+        # 如果调用方没有显式指定设备，就默认使用第 0 个识别器实例。
+        # OCR.__init__ 会按设备数创建多个 TextRecognizer，这里是在选择具体使用哪一个。
         if device_id is None:
             device_id = 0
+        # 把一批裁剪出来的小图交给底层文本识别器批量推理。
+        # 已读 TextRecognizer.__call__ 实现：
+        # 1. 先统计每张小图的宽高比，并按宽高比排序；
+        # 2. 以 rec_batch_num=16 为批大小分批处理；
+        # 3. 每个 batch 内先找最大宽高比，用 resize_norm_img() 把所有图统一到同一高度和动态宽度；
+        # 4. 把归一化后的 batch 一次性送进 ONNX 识别模型；
+        # 5. 用 CTCLabelDecode 把模型输出概率序列解码成 (text, score)。
+        # 这种实现的核心考量是：同一批图宽度越接近，padding 浪费越少，推理吞吐越高。
         rec_res, elapse = self.text_recognizer[device_id](img_list)
+        # texts 只保留识别出的文本字符串，置信度在这一层用来做过滤，不向上层继续暴露。
         texts = []
         for i in range(len(rec_res)):
+            # TextRecognizer.__call__ 返回的每一项都是 (识别文本, 置信度)。
             text, score = rec_res[i]
+            # 如果识别置信度低于 drop_score，就把结果置空。
+            # 这里当前阈值在 OCR.__init__ 中设为 0.5，属于偏保守的过滤策略：
+            # 宁可把不确定的小图交给上层当“无文本”处理，也不把低质量脏文本混进结果。
             if score < self.drop_score:
                 text = ""
+            # 最终只收集纯文本结果，和传入 img_list 一一对应。
             texts.append(text)
+        # 返回与输入顺序对齐的文本列表。
+        # 底层虽然为了效率对图片做了宽高比排序，但 TextRecognizer.__call__ 会在输出阶段映射回原顺序。
         return texts
 
     def __call__(self, img, device_id = 0, cls=True):

@@ -419,45 +419,85 @@ class RAGFlowPdfParser:
             ZM: Zoom factor
             auto_rotate: Whether to enable auto orientation correction
         """
+        # 进入表格结构识别阶段。
+        # 前面的 _layouts_rec() 只知道“这里是一个 table 区域”，
+        # 但还不知道表格内部的行、列、表头、跨行跨列单元格。
+        # 这一阶段就是把“表格区域”进一步拆成可重建 HTML/Markdown 表格的结构信息。
         logging.debug("Table processing...")
+        # imgs 保存裁出来的每个表格小图，后面统一交给 TableStructureRecognizer 做 TSR。
+        # pos 保存每张表格图在原 PDF 页里的位置和索引，方便把 TSR 的局部坐标映射回全局坐标。
         imgs, pos = [], []
+        # tbcnt 记录每页有多少个表格。
+        # 初始放 0，后面会做 np.cumsum，形成按页切分 recos 的前缀和。
         tbcnt = [0]
+        # 裁表格图时额外向四周扩 10 像素。
+        # 这样做是为了避免版面检测框刚好贴边，导致表格边线、首尾文字或表头被裁掉。
         MARGIN = 10
+        # tb_cpns 存放 Table Structure Recognition 识别出的表格组件。
+        # 组件包括 table row、table column、table column header、table spanning cell 等。
         self.tb_cpns = []
+        # 记录每个表格最终采用的旋转角度和评估分数。
+        # 表格方向不正会严重影响行列检测和 OCR，所以这里把旋转信息保存下来供后续重 OCR 和调试使用。
         self.table_rotations = {}  # Store rotation info for each table
+        # 保存参与 TSR 的表格图，可能是原图，也可能是自动纠正方向后的旋转图。
+        # 后续 _ocr_rotated_tables() 会复用这些图重新 OCR。
         self.rotated_table_imgs = {}  # Store rotated table images
 
+        # page_layout 来自 _layouts_rec()，page_images 来自 __images__()。
+        # 两者必须按页一一对应，否则“第 p 页的表格区域”会裁到错误的页图上。
         assert len(self.page_layout) == len(self.page_images)
 
-        # Collect layout info for all tables
+        # 收集所有表格的版面信息。
+        # 这里保留 page、table_index、原 layout 和裁剪坐标，
+        # 是为了后面把旋转 OCR 结果、TSR 结果、原页面坐标重新对齐。
         table_layouts = []  # [(page, table_layout, left, top, right, bott), ...]
 
+        # table_index 是跨页递增的全局表格编号。
+        # 不能只用页内 j，因为后面 table_rotations、rotated_table_imgs 都需要唯一 key。
         table_index = 0
         for p, tbls in enumerate(self.page_layout):  # for page
+            # 每页 layout 里可能有 text/title/figure/header 等多种区域，
+            # 表格结构识别只处理 type == "table" 的区域。
             tbls = [f for f in tbls if f["type"] == "table"]
+            # 记录当前页表格数量，后面用前缀和把全局 recos 切回“每页的表格列表”。
             tbcnt.append(len(tbls))
+            # 当前页没有表格就直接跳过，避免无意义裁图和 TSR 推理。
             if not tbls:
                 continue
             for tb in tbls:  # for table
+                # 在版面模型给出的 table 框外扩 MARGIN。
+                # tb 的坐标仍是 PDF 逻辑坐标，而裁剪 page_images 需要放大后的像素坐标，
+                # 所以下面会再乘以 ZM。
                 left, top, right, bott = tb["x0"] - MARGIN, tb["top"] - MARGIN, tb["x1"] + MARGIN, tb["bottom"] + MARGIN
+                # 乘回 zoomin 后的图像像素坐标。
+                # __images__ 把 PDF 页按 72 * ZM 渲染成图，所以 page_images 上的裁剪必须使用像素尺度。
                 left *= ZM
                 top *= ZM
                 right *= ZM
                 bott *= ZM
+                # 记录表格图左上角、所在页、全局表格编号。
+                # TSR 输出的是相对“表格小图”的坐标，后面要靠这些信息还原到页坐标。
                 pos.append((left, top, p, table_index))  # Add page and table_index
 
-                # Record table layout info
+                # 保存更完整的表格 layout 信息。
+                # _ocr_rotated_tables() 需要知道原始 table layout 和裁剪坐标，
+                # 才能删掉旧 OCR 框、插入旋转后重新识别的新框。
                 table_layouts.append({"page": p, "table_index": table_index, "layout": tb, "coords": (left, top, right, bott)})
 
-                # Crop table image
+                # 从整页图里裁出表格区域，减少 TSR 模型输入范围。
+                # 只识别表格小图比整页识别更快，也能降低正文、图片等区域干扰表格结构检测。
                 table_img = self.page_images[p].crop((left, top, right, bott))
 
                 if auto_rotate:
-                    # Evaluate table orientation
+                    # 自动评估表格方向。
+                    # 已读 _evaluate_table_orientation()：它会尝试 0/90/180/270 四个角度，
+                    # 对每个角度跑 OCR，用平均置信度和识别区域数计算综合分，
+                    # 只有非 0 度明显优于 0 度时才真正旋转，避免过度纠正。
                     logging.debug(f"Evaluating orientation for table {table_index} on page {p}")
                     best_angle, rotated_img, rotation_scores = self._evaluate_table_orientation(table_img)
 
-                    # Store rotation info
+                    # 保存方向评估结果。
+                    # 这些信息既用于后续重 OCR，也方便日志排查“为什么某个表被旋转了”。
                     self.table_rotations[table_index] = {
                         "page": p,
                         "original_pos": (left, top, right, bott),
@@ -466,70 +506,114 @@ class RAGFlowPdfParser:
                         "rotated_size": rotated_img.size,  # (width, height)
                     }
 
-                    # Store the rotated image
+                    # 后续 TSR 使用纠正方向后的表格图。
+                    # 这样行列结构检测是在“正常阅读方向”上完成的，尤其对横向/竖向旋转表格更稳。
                     self.rotated_table_imgs[table_index] = rotated_img
                     imgs.append(rotated_img)
 
                 else:
+                    # 关闭自动旋转时，直接使用原始裁剪图。
+                    # 同时仍然写入 rotation 信息，保持后续流程读取字段时结构一致。
                     imgs.append(table_img)
                     self.table_rotations[table_index] = {"page": p, "original_pos": (left, top, right, bott), "best_angle": 0, "scores": {}, "rotated_size": table_img.size}
                     self.rotated_table_imgs[table_index] = table_img
 
+                # 下一个表格使用新的全局编号。
                 table_index += 1
 
+        # tbcnt 初始有一个 0，之后每页 append 一次表格数，
+        # 所以长度应该等于 page_images 数量 + 1。
         assert len(self.page_images) == len(tbcnt) - 1
+        # 如果整份文档没有检测到任何表格，就不用继续跑 TSR。
         if not imgs:
             return
 
-        # Perform table structure recognition (TSR)
+        # 执行表格结构识别 TSR。
+        # 已读 TableStructureRecognizer.__call__()：
+        # 它会对每张表格图检测 table row、table column、table column header、spanning cell 等结构框；
+        # 然后对行框左右边界、列框上下边界做对齐修正，让结构框更规整。
+        # 输出 recos 与 imgs 一一对应：每个表格图对应一组结构组件。
         recos = self.tbl_det(imgs)
 
-        # If tables were rotated, re-OCR the rotated images and replace table boxes
+        # 如果启用了自动旋转，就需要对被旋转后的表格重新 OCR。
+        # 原因是：原来的 self.boxes 是在整页原方向上 OCR 得到的，
+        # 如果某个表格被旋转后才适合识别结构，那么表格内文字框也应该基于旋转后的正向图重新识别，
+        # 否则文字框和 TSR 行列坐标会对不上。
         if auto_rotate:
             self._ocr_rotated_tables(ZM, table_layouts, recos, tbcnt)
 
-        # Process TSR results (keep original logic but handle rotated coordinates)
+        # 把 TSR 结果整理进 self.tb_cpns。
+        # 这里处理的是“结构组件框”，不是正文 OCR 文本框；
+        # 之后会用这些组件框去给 self.boxes 里的 table 文本框打 R/H/C/SP 标签。
         tbcnt = np.cumsum(tbcnt)
         for i in range(len(tbcnt) - 1):  # for page
+            # pg 临时保存当前页所有表格组件。
             pg = []
             for j, tb_items in enumerate(recos[tbcnt[i] : tbcnt[i + 1]]):  # for table
+                # poss 是当前页所有表格的原始裁剪位置和编号。
+                # j 是页内第几个表格，用它和 tb_items 对齐。
                 poss = pos[tbcnt[i] : tbcnt[i + 1]]
                 for it in tb_items:  # for table components
-                    # TSR coordinates are relative to rotated image, need to record
+                    # TSR 坐标是相对“表格小图”的坐标，且在自动旋转场景下可能是相对旋转图。
+                    # 这里先额外保存一份 rotated 坐标，后面对列排序时可以使用更贴近 TSR 输入图的 x 坐标。
                     it["x0_rotated"] = it["x0"]
                     it["x1_rotated"] = it["x1"]
                     it["top_rotated"] = it["top"]
                     it["bottom_rotated"] = it["bottom"]
 
-                    # For rotated tables, coordinate transformation to page space requires rotation
-                    # Since we already re-OCR'd on rotated image, keep simple processing here
+                    # 给结构组件补上页号。
+                    # poss[j][2] 是该表格所在的页下标，后面按页匹配 table 文本框时会用到。
                     it["pn"] = poss[j][2]  # page number
+                    # layoutno 记录页内第几个表格，用于区分同一页上的多个表格结构。
                     it["layoutno"] = j
+                    # table_index 是跨页全局表格编号，用于和 rotation 信息、重 OCR 结果对齐。
                     it["table_index"] = poss[j][3]  # table index
                     pg.append(it)
+            # 把当前页的表格结构组件加入全局组件列表。
             self.tb_cpns.extend(pg)
 
         def gather(kwd, fzy=10, ption=0.6):
+            # 从所有 TSR 组件中筛选 label 匹配 kwd 的组件，比如 header、row、spanning。
+            # 先按 Y 方向排序，是为了让行/表头的编号符合从上到下的阅读顺序。
             eles = Recognizer.sort_Y_firstly([r for r in self.tb_cpns if re.match(kwd, r["label"])], fzy)
+            # 清理和 OCR 文本框明显不匹配的结构区域。
+            # layouts_cleanup 会利用现有 self.boxes 做几何对齐过滤，减少 TSR 假阳性。
             eles = Recognizer.layouts_cleanup(self.boxes, eles, 5, ption)
+            # 再做一次严格排序，保证后续索引 ii 是稳定的视觉顺序。
             return Recognizer.sort_Y_firstly(eles, 0)
 
-        # add R,H,C,SP tag to boxes within table layout
+        # 收集不同类型的表格结构组件。
+        # headers 用来给文本框标记表头区域 H；
+        # rows 用来标记所在行 R；
+        # spans 用来标记跨行/跨列单元格 SP。
         headers = gather(r".*header$")
         rows = gather(r".* (row|header)")
         spans = gather(r".*spanning")
+        # 单独收集列组件。
+        # 列的排序主要按页、表格编号、x 坐标进行；
+        # 如果保存了 x0_rotated，就优先用旋转图坐标，因为它更贴近 TSR 模型看到的表格方向。
         clmns = sorted([r for r in self.tb_cpns if re.match(r"table column$", r["label"])], key=lambda x: (x["pn"], x["layoutno"], x["x0_rotated"] if "x0_rotated" in x else x["x0"]))
+        # 对列组件也做一次几何清理，减少错误列框影响后续表格重建。
         clmns = Recognizer.layouts_cleanup(self.boxes, clmns, 5, 0.5)
 
+        # 遍历 OCR/文本框，把落在表格布局里的文本框和 TSR 结构组件关联起来。
+        # 这一轮会给文本框添加 R/H/C/SP 等字段；
+        # 后面的 construct_table() 会利用这些字段重建行列矩阵。
         for b in self.boxes:
+            # 只处理版面类型为 table 的文本框。
+            # 正文、标题、图片说明等不应该参与表格行列结构匹配。
             if b.get("layout_type", "") != "table":
                 continue
+            # 找到当前文本框重叠最多的行组件。
+            # 命中后写入 R、R_top、R_bott，表示它属于哪一行以及该行的上下边界。
             ii = Recognizer.find_overlapped_with_threshold(b, rows, thr=0.3)
             if ii is not None:
                 b["R"] = ii
                 b["R_top"] = rows[ii]["top"]
                 b["R_bott"] = rows[ii]["bottom"]
 
+            # 找到当前文本框是否落在表头组件里。
+            # 表头信息比普通行更重要，后续构造表格时可以帮助识别 header cell。
             ii = Recognizer.find_overlapped_with_threshold(b, headers, thr=0.3)
             if ii is not None:
                 b["H_top"] = headers[ii]["top"]
@@ -538,12 +622,16 @@ class RAGFlowPdfParser:
                 b["H_right"] = headers[ii]["x1"]
                 b["H"] = ii
 
+            # 找到水平方向上最贴合的列组件。
+            # 列匹配更关注 x 方向范围，因此不用普通 overlap，而用 horizontally tightest fit。
             ii = Recognizer.find_horizontally_tightest_fit(b, clmns)
             if ii is not None:
                 b["C"] = ii
                 b["C_left"] = clmns[ii]["x0"]
                 b["C_right"] = clmns[ii]["x1"]
 
+            # 检查当前文本框是否属于跨行/跨列单元格。
+            # 命中时写入 SP，同时复用 H_* 边界字段记录这个 spanning cell 的范围。
             ii = Recognizer.find_overlapped_with_threshold(b, spans, thr=0.3)
             if ii is not None:
                 b["H_top"] = spans[ii]["top"]
@@ -700,60 +788,109 @@ class RAGFlowPdfParser:
             logging.info(f"Added {added} OCR results from rotated table {table_index}")
 
     def __ocr(self, pagenum, img, chars, ZM=3, device_id: int | None = None):
+        # 记录 OCR 检测阶段耗时，便于排查 PDF 页图过大、模型推理慢等性能问题。
         start = timer()
+        # 先把 PIL Image 转成 numpy 数组交给 OCR 检测器。
+        # 已读子函数实现：OCR.detect() 内部调用 TextDetector，返回检测到的文本框；
+        # 它只做“文字区域检测”，不做真正识别，返回值里识别文本先是空字符串。
+        # 这样拆成 detect + recognize 两段，是为了后面能优先复用 PDF 原生文字，
+        # 只有原生文字缺失或乱码时才裁图识别，减少 OCR 成本和误差。
         bxs = self.ocr.detect(np.array(img), device_id)
         logging.info(f"__ocr detecting boxes of an image cost ({timer() - start}s)")
 
+        # 重新计时，下面进入“检测框整理 + PDF 原生字符合并”阶段。
         start = timer()
+        # 如果 OCR 没检测到任何文字框，也要给当前页追加一个空列表。
+        # self.boxes 是按页对齐的，后续 layout 识别会假设 page_images 和 boxes 数量一致。
         if not bxs:
             self.boxes.append([])
             return
+        # OCR.detect() 返回的是 zip(box, ("", score)) 形式；
+        # 这里保留检测框 line[0] 和识别文本 line[1][0]。
+        # detect 阶段文本通常为空，但字段先保留，后面统一删掉 txt。
         bxs = [(line[0], line[1][0]) for line in bxs]
+        # 把 OCR 检测框转换成 RAGFlow 内部统一 bbox 字典。
+        # OCR 框坐标来自放大后的页图，所以要除以 ZM 还原到 PDF 逻辑坐标系。
+        # 已读 Recognizer.sort_Y_firstly()：它按 top 排序，如果 top 差小于阈值，就按 x0 排序；
+        # 这符合常见阅读顺序“先从上到下，同一行从左到右”。
+        # 阈值使用 mean_height / 3，是为了容忍同一行字符/框的微小垂直抖动。
         bxs = Recognizer.sort_Y_firstly(
             [
                 {"x0": b[0][0] / ZM, "x1": b[1][0] / ZM, "top": b[0][1] / ZM, "text": "", "txt": t, "bottom": b[-1][1] / ZM, "chars": [], "page_number": pagenum}
                 for b, t in bxs
+                # 过滤掉坐标反向的异常框，避免后面计算宽高、重叠面积时出错。
                 if b[0][0] <= b[1][0] and b[0][1] <= b[-1][1]
             ],
             self.mean_height[pagenum - 1] / 3,
         )
 
         # merge chars in the same rect
+        # chars 是 pdfplumber/pdfminer 从 PDF 文本层抽出来的原生字符。
+        # 这一段的策略是：先把原生字符塞回它所在的 OCR 检测框里。
+        # 原理上 PDF 原生文字通常比 OCR 更准、更快；OCR 主要作为扫描件或乱码文本的兜底。
         for c in chars:
+            # 已读 Recognizer.find_overlapped()：它利用按 Y 排好序的 boxes 做一个近似二分收窄，
+            # 再计算重叠面积，返回和当前字符重叠最多的检测框下标。
+            # 这样比对所有框全量扫描更省，也能把 PDF 字符归并到对应文字行/区域。
             ii = Recognizer.find_overlapped(c, bxs)
+            # 找不到任何重叠框的字符先放到 lefted_chars。
+            # 这些字符可能是检测漏掉的文字、页眉页脚碎片，或者 PDF 坐标异常的残留。
             if ii is None:
                 self.lefted_chars.append(c)
                 continue
+            # 计算 PDF 字符高度和 OCR 检测框高度。
+            # 如果两者差异过大，说明这个字符虽然重叠，但很可能不属于这个框。
             ch = c["bottom"] - c["top"]
             bh = bxs[ii]["bottom"] - bxs[ii]["top"]
+            # 高度差比例超过 0.7 且不是空格时，认为匹配不可信。
+            # 保留空格的原因是空格本身没有稳定视觉高度，但对英文/数字间隔很重要。
             if abs(ch - bh) / max(ch, bh) >= 0.7 and c["text"] != " ":
                 self.lefted_chars.append(c)
                 continue
+            # 匹配可信时，把这个 PDF 原生字符归到对应 OCR 框里。
             bxs[ii]["chars"].append(c)
 
+        # 现在每个 OCR 框里可能已经挂了一批 PDF 原生字符。
+        # 这一段尝试用原生字符拼出框文本，只有无法拼出或判断为乱码时才回退到 OCR 识别。
         for b in bxs:
+            # 如果这个检测框没有任何 PDF 原生字符，就保留空 text，后面会裁图走 OCR。
             if not b["chars"]:
                 del b["chars"]
                 continue
+            # 保存当前框内字符，后面乱码判断需要看字符本身和字体信息。
             box_chars = b["chars"]
+            # 用框内字符平均高度作为排序阈值。
+            # 已读 sort_Y_firstly() 的排序策略：高度接近时按 x 排，同一文本行会更自然。
             m_ht = np.mean([c["height"] for c in box_chars])
+            # garbled_count / total_count 用来判断 PDF 原生文本是否乱码。
+            # 这是为了避免“PDF 有文本层但字体映射坏了”时错误信任原生文本。
             garbled_count = 0
             total_count = 0
             for c in Recognizer.sort_Y_firstly(box_chars, m_ht):
+                # 对空格做特殊处理：只有当前框已有文本，并且前一个字符像英文、数字或标点时才补空格。
+                # 这样能保留英文单词/数字之间的分隔，又避免中文文本被无意义空格打碎。
                 if c["text"] == " " and b["text"]:
                     if re.match(r"[0-9a-zA-Zа-яА-Я,.?;:!%%]", b["text"][-1]):
                         b["text"] += " "
                 else:
+                    # 非空格字符直接追加到当前框文本中。
                     b["text"] += c["text"]
                     for ch in c["text"]:
+                        # 统计非空白字符数量；空白字符不参与乱码比例判断。
                         if not ch.isspace():
                             total_count += 1
+                            # 已读 _is_garbled_char()：它把 Unicode 私用区、替换符、非法/代理类别、
+                            # 控制字符等视为乱码。这些通常表示 pdfminer 无法把 CID 映射成真实 Unicode。
                             if self._is_garbled_char(ch):
                                 garbled_count += 1
+            # 字符已经拼进 text，临时 chars 字段不再需要，避免后续结构膨胀。
             del b["chars"]
             # If the majority of characters from pdfplumber are garbled,
             # clear the text so OCR recognition will be used as fallback.
             # Strategy 1: PUA / unmapped CID characters
+            # 策略 1：如果原生字符里超过一半是私用区/CID 映射失败等明显乱码，
+            # 就清空 text，强制后续用 OCR 图像识别替代原生文本。
+            # 取 0.5 是一个偏保守阈值：少量异常字符可以容忍，多数异常才判定整框不可信。
             if total_count > 0 and garbled_count / total_count >= 0.5:
                 logging.info(
                     "Page %d: detected garbled pdfplumber text (garbled=%d/%d), falling back to OCR for box at (%.1f, %.1f)",
@@ -763,6 +900,10 @@ class RAGFlowPdfParser:
                 continue
             # Strategy 2: font-encoding garbling — all chars are ASCII
             # punctuation from subset fonts (no CJK output)
+            # 策略 2：处理“字体编码映射错但字符不是私用区”的情况。
+            # 已读 _is_garbled_by_font_encoding()：它检查 subset font 前缀比例、CJK 字符比例、
+            # ASCII 标点符号比例；如果大量字符来自子集字体，且几乎没有 CJK，却有很多 ASCII 标点，
+            # 就认为是中文 glyph 被错误映射成符号。这类问题必须回退到 OCR。
             if total_count > 0 and self._is_garbled_by_font_encoding(box_chars, min_chars=5):
                 logging.info(
                     "Page %d: detected font-encoding garbled text (%d chars), falling back to OCR for box at (%.1f, %.1f)",
@@ -770,32 +911,78 @@ class RAGFlowPdfParser:
                 )
                 b["text"] = ""
 
+        # 记录 PDF 原生字符归并和乱码检测的耗时。
         logging.info(f"__ocr sorting {len(chars)} chars cost {timer() - start}s")
+        # 重新计时，下面进入“对缺文本框做 OCR 识别”的阶段。
         start = timer()
+        # boxes_to_reg 只收集需要 OCR 识别的框。
+        # 这样能避免对已经有可信 PDF 原生文本的框重复 OCR，提高速度并降低识别误差。
         boxes_to_reg = []
+        # 复用整页图像的 numpy 形式，后面裁剪每个待识别框。
         img_np = np.array(img)
         for b in bxs:
+            # 只有 text 为空的框才需要走图像 OCR。
+            # text 为空通常有三种情况：纯扫描件、PDF 原生字符没覆盖到、原生字符被判定为乱码。
             if not b["text"]:
+                # 把逻辑坐标乘回 ZM，恢复到放大页图上的像素坐标。
                 left, right, top, bott = b["x0"] * ZM, b["x1"] * ZM, b["top"] * ZM, b["bottom"] * ZM
+                # 已读 OCR.get_rotate_crop_image()：它用四点透视变换把检测框裁成正向小图；
+                # 如果裁出来是高瘦竖图，还会尝试原图、顺时针 90 度、逆时针 90 度，
+                # 用识别器置信度选最佳方向。这样能提高竖排/旋转文字的识别稳定性。
                 b["box_image"] = self.ocr.get_rotate_crop_image(img_np, np.array([[left, top], [right, top], [right, bott], [left, bott]], dtype=np.float32))
+                # 收集起来批量识别，批处理通常比逐框调用模型更高效。
                 boxes_to_reg.append(b)
+            # txt 是 detect 阶段留下的临时字段，后面不再使用，删除以保持 box 结构干净。
             del b["txt"]
+        # 已读 OCR.recognize_batch()：它调用 TextRecognizer 批量识别裁剪图，
+        # 并用 drop_score=0.5 过滤低置信度结果，低分会置为空字符串。
+        # 这里批量识别能减少模型调用开销，也保证所有待补文本框走同一识别阈值。
         texts = self.ocr.recognize_batch([b["box_image"] for b in boxes_to_reg], device_id)
         for i in range(len(boxes_to_reg)):
+            # 把 OCR 识别结果写回对应检测框。
             boxes_to_reg[i]["text"] = texts[i]
+            # 裁剪图只是识别中间产物，识别结束后删除，避免占用大量内存。
             del boxes_to_reg[i]["box_image"]
+        # 记录 OCR 识别阶段耗时。日志里 len(bxs) 是总检测框数，不只是 boxes_to_reg 数。
         logging.info(f"__ocr recognize {len(bxs)} boxes cost {timer() - start}s")
+        # 过滤掉最终仍然没有文本的框。
+        # 这些框可能是误检、低置信度 OCR 结果，或图片/线条区域。
         bxs = [b for b in bxs if b["text"]]
+        # 如果当前页还没有平均行高，就用最终文本框高度的中位数补一个。
+        # 中位数比均值更抗异常框，后续排序、合并、布局判断都会依赖 mean_height。
         if self.mean_height[pagenum - 1] == 0:
             self.mean_height[pagenum - 1] = np.median([b["bottom"] - b["top"] for b in bxs])
+        # 把当前页的 OCR/文本层融合结果追加到 self.boxes。
+        # 后续 layout 识别、列判断、文本合并都会基于这些 box 继续处理。
         self.boxes.append(bxs)
 
     def _layouts_rec(self, ZM, drop=True):
+        # 进入版面识别前，先确认“页图数量”和“每页 OCR/文本框结果数量”是一一对应的。
+        # 因为 LayoutRecognizer 会按页并行处理 image_list 和 ocr_res，
+        # 如果两边页数不一致，后面把版面区域和文本框对齐时就会整页错位。
         assert len(self.page_images) == len(self.boxes)
+        # self.layouter 在 __init__() 里按环境被绑定成 LayoutRecognizer 或 AscendLayoutRecognizer。
+        # 它的职责不是重新做 OCR，而是：
+        # 1) 对整页图像做版面目标检测，识别 text/title/table/figure/header/footer/reference 等区域；
+        # 2) 把这些版面区域和现有 OCR 文本框按重叠关系对齐；
+        # 3) 给文本框补上 layout_type / layoutno；
+        # 4) 在 drop=True 时丢弃页眉、页脚、参考文献等被视为噪声的块；
+        # 5) 对没有文本框覆盖到的 figure/equation，补出一个空文本框占位。
+        # 这里把 OCR 结果和版面结果合成，目的是让后续文本合并、表格处理、图文抽取都基于“带语义标签”的 box 工作。
+        # ZM 传进去是因为版面模型看的坐标来自放大后的页图，需要再按 scale_factor 映射回 PDF 逻辑坐标。
         self.boxes, self.page_layout = self.layouter(self.page_images, self.boxes, ZM, drop=drop)
-        # cumlative Y
+        # 上一步返回的 self.boxes 里的 top/bottom 仍然是“页内局部坐标”：
+        # 第 1 页和第 2 页各自都从 y=0 开始。
+        # 但后续很多逻辑，比如全文排序、跨页拼接、统一定位，更适合使用“整篇累计坐标”。
+        # 所以这里把每个 box 的纵坐标整体加上该页之前所有页的累计高度。
+        # 这样做完后，不同页上的框就能被放进同一个全局坐标系里比较。
+        # 这一步只平移 Y，不改 X，因为跨页串接主要依赖的是纵向阅读顺序。
+        # cumulative Y
         for i in range(len(self.boxes)):
+            # page_number 是从 1 开始记的，因此访问 page_cum_height 时要减 1。
+            # 比如第 1 页加 0，第 2 页加第 1 页高度，第 3 页加前两页高度之和。
             self.boxes[i]["top"] += self.page_cum_height[self.boxes[i]["page_number"] - 1]
+            # bottom 同样要一起平移，保持框的高度和相对位置不变。
             self.boxes[i]["bottom"] += self.page_cum_height[self.boxes[i]["page_number"] - 1]
 
     def _assign_column(self, boxes, zoomin=3):
@@ -883,41 +1070,69 @@ class RAGFlowPdfParser:
         return boxes
 
     def _text_merge(self, zoomin=3):
-        # merge adjusted boxes
+        # 这一阶段做“同一行内”的横向文本框合并。
+        # 前面的 OCR 和 layout 识别会产出很多碎框：
+        # 有时一个视觉上的完整行会被切成多个相邻 box。
+        # 如果不先把这些同一行碎框合并，后续段落合并和 chunking 都会出现断裂。
+        # 这里先给文本框分栏，是为了避免双栏 PDF 中左栏末尾和右栏开头被误认为同一行相邻内容。
         bxs = self._assign_column(self.boxes, zoomin)
 
         def end_with(b, txt):
+            # 判断某个 box 的文本是否以指定字符串结尾。
+            # 这个 helper 目前在当前函数里没有被使用，属于历史合并规则留下的辅助函数。
             txt = txt.strip()
             tt = b.get("text", "").strip()
             return tt and tt.find(txt) == len(tt) - len(txt)
 
         def start_with(b, txts):
+            # 判断某个 box 的文本是否以 txts 中任意字符串开头。
+            # 和 end_with 一样，这里当前未参与实际逻辑，但保留可能是为了后续扩展规则。
             tt = b.get("text", "").strip()
             return tt and any([tt.find(t.strip()) == 0 for t in txts])
 
-        # horizontally merge adjacent box with the same layout
+        # 横向合并相邻 box。
+        # 核心原则是：只有同页、同栏、同 layout 区域、且垂直位置足够接近的相邻框才合并。
+        # 这样能恢复被 OCR/文本层切碎的同一行，同时尽量避免跨栏、跨段、跨表格误合并。
         i = 0
         while i < len(bxs) - 1:
+            # 当前框。
             b = bxs[i]
+            # 紧邻的下一个框。
             b_ = bxs[i + 1]
 
+            # 不同页或不同栏的框不能合并。
+            # 页和栏是阅读顺序里最强的边界，跨过去合并通常就是错误。
             if b["page_number"] != b_["page_number"] or b.get("col_id") != b_.get("col_id"):
                 i += 1
                 continue
 
+            # 不同 layoutno 说明它们属于不同版面区域，比如不同段落、不同标题块或不同表格区域。
+            # table/figure/equation 也禁止在这里合并，因为这些内容需要保留结构边界，
+            # 尤其表格要交给表格结构逻辑处理，不能按普通正文拼接。
             if b.get("layoutno", "0") != b_.get("layoutno", "1") or b.get("layout_type", "") in ["table", "figure", "equation"]:
                 i += 1
                 continue
 
+            # _y_dis 返回两个框中心点的纵向距离。
+            # 如果纵向距离小于当前页平均字符高度的 1/3，就认为它们在同一视觉行上。
+            # 用 mean_height 做尺度归一化，是为了适配不同字号、不同分辨率的 PDF。
             if abs(self._y_dis(b, b_)) < self.mean_height[bxs[i]["page_number"] - 1] / 3:
-                # merge
+                # 合并时把右边界扩展到后一个框的右边界。
+                # 因为这是横向合并，通常 b_ 在 b 右侧。
                 bxs[i]["x1"] = b_["x1"]
+                # top/bottom 取平均，是为了把两个轻微上下抖动的框拉回同一条水平线上。
                 bxs[i]["top"] = (b["top"] + b_["top"]) / 2
                 bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
+                # 文本直接拼接，不主动加空格。
+                # 空格恢复在 __images__ 里对英文/数字间距已经做过一轮；
+                # 这里保守拼接，避免中文文本被插入多余空格。
                 bxs[i]["text"] += b_["text"]
+                # 删除被合并的后一个框。
+                # i 不递增，让当前合并后的框继续尝试和新的下一个框合并。
                 bxs.pop(i + 1)
                 continue
             i += 1
+        # 用合并后的结果替换全局 boxes，后续 _concat_downward 和过滤逻辑会继续基于它处理。
         self.boxes = bxs
 
     def _naive_vertical_merge(self, zoomin=3):
@@ -1025,148 +1240,234 @@ class RAGFlowPdfParser:
         self.boxes = new_boxes
 
     def _concat_downward(self, concat_between_pages=True):
+        # 当前版本的真实行为：只把所有 box 按阅读方向做一次 Y 优先排序，然后立即返回。
+        # 也就是说，下面保留的大段“纵向段落合并”代码当前不会执行。
+        # 这样做的工程含义是：RAGFlow 现在更倾向保留版面框粒度，
+        # 把更大粒度的 chunk 合并交给后面的 naive_merge/tokenize 阶段处理，
+        # 避免在 PDF 解析层过早把上下块拼错。
+        # sort_Y_firstly 的规则是：先按 top 从上到下排，Y 差很小时再按 x0 从左到右排。
         self.boxes = Recognizer.sort_Y_firstly(self.boxes, 0)
+        # 这里的 return 让下面旧的纵向合并逻辑变成“保留但不启用”的代码。
+        # 注释仍然补在下面，是为了你读源码时知道历史设计意图。
         return
 
-        # count boxes in the same row as a feature
+        # 以下是历史/备用纵向合并逻辑，当前不会执行。
+        # 它原本的思路是：先统计每个 box 附近同一行的框数量，作为后续机器学习模型判断上下拼接的特征之一。
         for i in range(len(self.boxes)):
+            # 当前 box 所在页的平均字符高度，用来把纵向距离归一化。
             mh = self.mean_height[self.boxes[i]["page_number"] - 1]
+            # in_row 记录当前 box 附近同一视觉行上的邻居数量。
+            # 值越大，越可能是表格/多栏/复杂排版，而不是普通单段落。
             self.boxes[i]["in_row"] = 0
+            # 只看当前位置前后最多 12 个 box，避免全量 O(n^2) 比较。
             j = max(0, i - 12)
             while j < min(i + 12, len(self.boxes)):
+                # 跳过自己。
                 if j == i:
                     j += 1
                     continue
+                # 用中心点纵向距离除以平均行高，判断是否在同一行附近。
                 ydis = self._y_dis(self.boxes[i], self.boxes[j]) / mh
                 if abs(ydis) < 1:
+                    # 纵向距离小于一个行高，认为在同一行附近。
                     self.boxes[i]["in_row"] += 1
                 elif ydis > 0:
+                    # 因为 boxes 已按 Y 排序，如果后面的框已经明显在下方，就可以提前停止。
                     break
                 j += 1
 
-        # concat between rows
+        # 下面尝试把上下相邻的 box 串成段落块。
+        # 逻辑会复制一份 boxes，避免在 DFS 过程中直接破坏原列表导致遍历混乱。
         boxes = deepcopy(self.boxes)
+        # blocks 保存一组组被认为应该纵向拼接的 box。
         blocks = []
         while boxes:
+            # chunks 是从当前起点 DFS 找到的一条向下拼接链。
             chunks = []
 
             def dfs(up, dp):
+                # 把当前上方 box 放入拼接链。
                 chunks.append(up)
+                # 从 dp 开始向后找可能接在 up 下方的 box。
                 i = dp
                 while i < min(dp + 12, len(boxes)):
+                    # 计算 up 和候选 down 的纵向中心距离。
                     ydis = self._y_dis(up, boxes[i])
+                    # 判断两者是否在同一页。
                     smpg = up["page_number"] == boxes[i]["page_number"]
+                    # 取 up 所在页的平均字符高度和宽度，作为距离阈值尺度。
                     mh = self.mean_height[up["page_number"] - 1]
                     mw = self.mean_width[up["page_number"] - 1]
+                    # 同页情况下，如果候选框离得超过 4 个行高，就认为已经不是同一段。
                     if smpg and ydis > mh * 4:
                         break
+                    # 跨页情况下容忍更大的纵向距离，因为 page_cum_height 已经把页高累计进来了。
                     if not smpg and ydis > mh * 16:
                         break
                     down = boxes[i]
+                    # 如果调用方禁止跨页拼接，遇到下一页就停止。
                     if not concat_between_pages and down["page_number"] > up["page_number"]:
                         break
 
+                    # 表格行号 R 不同且上文不是逗号结尾时，不拼。
+                    # 这是为了避免把表格不同行硬拼成一句话。
                     if up.get("R", "") != down.get("R", "") and up["text"][-1] != "，":
                         i += 1
                         continue
 
+                    # 跳过类似页码/编号格式和空文本。
+                    # 这类内容通常不应参与正文段落拼接。
                     if re.match(r"[0-9]{2,3}/[0-9]{3}$", up["text"]) or re.match(r"[0-9]{2,3}/[0-9]{3}$", down["text"]) or not down["text"].strip():
                         i += 1
                         continue
 
+                    # 任一侧为空文本都不拼。
                     if not down["text"].strip() or not up["text"].strip():
                         i += 1
                         continue
 
+                    # 如果两个框在水平方向相距太远，说明可能是不同栏、不同表格列或不同区域。
                     if up["x1"] < down["x0"] - 10 * mw or up["x0"] > down["x1"] + 10 * mw:
                         i += 1
                         continue
 
+                    # 对普通 text layout，如果很近的候选框属于同一个 layoutno，就直接拼接。
+                    # 这是一个强规则，优先于下面的 ML 模型。
                     if i - dp < 5 and up.get("layout_type") == "text":
                         if up.get("layoutno", "1") == down.get("layoutno", "2"):
+                            # 递归继续向下找下一个可拼框。
                             dfs(down, i + 1)
+                            # 从候选列表中移除已经被吸收的框。
                             boxes.pop(i)
                             return
                         i += 1
                         continue
 
+                    # 对不满足强规则的候选，抽取几何、版面、标点、词性等特征。
+                    # 已读 _updown_concat_features()：它会生成一组特征给 XGBoost 模型判断上下框是否应该合并。
                     fea = self._updown_concat_features(up, down)
+                    # 模型分数 <= 0.5 时认为不应拼接。
                     if self.updown_cnt_mdl.predict(xgb.DMatrix([fea]))[0] <= 0.5:
                         i += 1
                         continue
+                    # 模型认为可拼接，则继续 DFS 向下扩展链。
                     dfs(down, i + 1)
                     boxes.pop(i)
                     return
 
+            # 从当前列表第一个 box 开始尝试构造一条纵向拼接链。
             dfs(boxes[0], 1)
+            # 起点 box 已经处理完，从候选列表移除。
             boxes.pop(0)
             if chunks:
+                # 保存当前拼接链。
                 blocks.append(chunks)
 
-        # concat within each block
+        # 把每个 block 内的多个 box 真正合并成一个大 box。
         boxes = []
         for b in blocks:
+            # 只有一个 box 的 block 不需要合并。
             if len(b) == 1:
                 boxes.append(b[0])
                 continue
+            # t 作为合并目标，逐个吸收后续 box。
             t = b[0]
             for c in b[1:]:
+                # 去掉首尾空白，避免拼接时产生意外空格。
                 t["text"] = t["text"].strip()
                 c["text"] = c["text"].strip()
                 if not c["text"]:
                     continue
+                # 如果前后都是英文/数字类字符，插入一个空格，避免词粘连。
                 if t["text"] and re.match(r"[0-9\.a-zA-Z]+$", t["text"][-1] + c["text"][-1]):
                     t["text"] += " "
+                # 拼接文本。
                 t["text"] += c["text"]
+                # 合并后的框覆盖所有子框的横向范围。
                 t["x0"] = min(t["x0"], c["x0"])
                 t["x1"] = max(t["x1"], c["x1"])
+                # 跨页拼接时，page_number 保留最早的页号。
                 t["page_number"] = min(t["page_number"], c["page_number"])
+                # bottom 延伸到最后一个被合并框。
                 t["bottom"] = c["bottom"]
+                # 如果原框没有 layout_type，而子框有，就继承子框类型。
                 if not t["layout_type"] and c["layout_type"]:
                     t["layout_type"] = c["layout_type"]
             boxes.append(t)
 
+        # 合并完成后重新按阅读顺序排序。
         self.boxes = Recognizer.sort_Y_firstly(boxes, 0)
 
     def _filter_forpages(self):
+        # 这一阶段做页级/目录级清洗。
+        # 目标不是一般文本清洗，而是去掉 PDF 里经常会混入正文的目录页、致谢页、乱码脏页等。
         if not self.boxes:
             return
+        # findit 表示是否找到了明确的目录/致谢入口。
+        # 一旦找到并处理，就不再走后面的脏页检测分支。
         findit = False
+        # 使用 while + 手动 i，是因为过程中会不断 pop 删除 box。
         i = 0
         while i < len(self.boxes):
+            # 查找目录/目次/table of contents/致谢/acknowledge 这类页面标题。
+            # 先去掉普通空格和全角空格，再 lower，是为了兼容 OCR 和 PDF 文本层的不同空白形式。
             if not re.match(r"(contents|目录|目次|table of contents|致谢|acknowledge)$", re.sub(r"( | |\u3000)+", "", self.boxes[i]["text"].lower())):
                 i += 1
                 continue
+            # 找到目录/致谢入口。
             findit = True
+            # 判断当前标题是否更像英文。
+            # 英文目录行通常用前几个单词作为重复前缀，中文则用前几个字符。
             eng = re.match(r"[0-9a-zA-Z :'.-]{5,}", self.boxes[i]["text"].strip())
+            # 删除目录/致谢标题本身。
             self.boxes.pop(i)
             if i >= len(self.boxes):
                 break
+            # 取标题后第一条有效内容的前缀。
+            # 中文取前三个字符，英文取前两个词，用来判断目录列表到哪里结束。
             prefix = self.boxes[i]["text"].strip()[:3] if not eng else " ".join(self.boxes[i]["text"].strip().split()[:2])
+            # 如果标题后面有空文本框，连续删除，直到拿到一个可用于匹配的 prefix。
             while not prefix:
                 self.boxes.pop(i)
                 if i >= len(self.boxes):
                     break
                 prefix = self.boxes[i]["text"].strip()[:3] if not eng else " ".join(self.boxes[i]["text"].strip().split()[:2])
+            # 删除第一条目录项。
+            # 后面会向下寻找同样 prefix 再次出现的位置，用来估计这一整段目录块的边界。
             self.boxes.pop(i)
             if i >= len(self.boxes) or not prefix:
                 break
+            # 在后续最多 128 个框里寻找相同前缀。
+            # 目录页常见模式是若干条目录项有相似开头或重复结构；
+            # 找到重复后，把中间部分作为目录块删除。
             for j in range(i, min(i + 128, len(self.boxes))):
                 if not re.match(prefix, self.boxes[j]["text"]):
                     continue
+                # 删除 i 到 j 之间的目录内容。
+                # 注意每次都 pop(i)，因为列表左移后下一个待删元素仍在 i。
                 for k in range(i, j):
                     self.boxes.pop(i)
                 break
+        # 如果已经基于明确目录/致谢标志做过过滤，就直接结束。
+        # 避免再用“脏页启发式”误删正常页面。
         if findit:
             return
 
+        # 如果没有发现目录/致谢，就再做一种页级乱码检测。
+        # page_dirty 按页计数，统计每页出现疑似目录点线/乱码点串的次数。
         page_dirty = [0] * len(self.page_images)
         for b in self.boxes:
+            # 这里匹配连续点状符号。
+            # 这类符号常见于目录页的引导线，也可能来自 OCR/PDF 抽取中的脏字符。
             if re.search(r"(··|··|··)", b["text"]):
                 page_dirty[b["page_number"] - 1] += 1
+        # 如果某页出现超过 3 次点状脏符号，就把整页标为 dirty。
         page_dirty = set([i + 1 for i, t in enumerate(page_dirty) if t > 3])
+        # 没有脏页则不做任何删除。
         if not page_dirty:
             return
+        # 删除所有属于 dirty 页的 box。
+        # 这是比较激进的页级过滤，所以只有在重复脏符号足够多时才触发。
         i = 0
         while i < len(self.boxes):
             if self.boxes[i]["page_number"] in page_dirty:
@@ -1201,81 +1502,131 @@ class RAGFlowPdfParser:
             self.boxes.pop(i)
 
     def _extract_table_figure(self, need_image, ZM, return_html, need_position, separate_tables_figures=False):
+        # 这一阶段把 self.boxes 里的“普通正文框”和“表格/图片相关框”正式分流。
+        # 前面的 _table_transformer_job() 已经给表格文本框打上了 R/H/C/SP 等结构标签，
+        # 这里要做的是：
+        # 1) 从整体 boxes 中抽出 table / figure 区域；
+        # 2) 尝试把 caption 归并到最近的表格或图片；
+        # 3) 从 page_images 中裁出对应图像；
+        # 4) 对表格调用 construct_table() 组装成 HTML 或文字描述；
+        # 5) 返回“图像 + 结构化内容”的结果，同时把这些区域从正文流里移走。
         tables = {}
         figures = {}
-        # extract figure and table boxes
+        # 第一轮扫描：把已经被 layout 识别为 table / figure 的 box 从 self.boxes 里摘出来。
+        # tables / figures 的 key 使用 page_number-layoutno，
+        # 表示“同一页里的同一个布局区域”。
         i = 0
+        # lst_lout_no 记录上一个处理到的 layout 编号。
+        # 后面如果遇到 caption/title/reference，会把这个布局编号加入 nomerge_lout_no，
+        # 用来阻止某些跨页表格被错误合并。
         lst_lout_no = ""
+        # 记录不应该执行跨页合并的布局编号。
+        # 典型场景是：某个 table/figure 附近已经出现 caption、title、reference，
+        # 说明它的边界更明确，继续和下一页同类区域硬拼的风险更高。
         nomerge_lout_no = []
         while i < len(self.boxes):
+            # 没有 layoutno 的框通常不是明确的版面块，不参与表格/图片抽取。
             if "layoutno" not in self.boxes[i]:
                 i += 1
                 continue
+            # layout 唯一键：页号 + layout 编号。
             lout_no = str(self.boxes[i]["page_number"]) + "-" + str(self.boxes[i]["layoutno"])
+            # caption / title / figure caption / reference 这些块一旦出现，
+            # 通常意味着前一个 table/figure 布局边界已经足够明确，不应随便跨页续接。
             if TableStructureRecognizer.is_caption(self.boxes[i]) or self.boxes[i]["layout_type"] in ["table caption", "title", "figure caption", "reference"]:
                 nomerge_lout_no.append(lst_lout_no)
+            # 处理表格框。
             if self.boxes[i]["layout_type"] == "table":
+                # “数据来源/资料来源/图表来源”这类来源说明通常不当作表格正文内容。
+                # 如果保留，会污染表格单元格文本，所以这里直接丢掉。
                 if re.match(r"(数据|资料|图表)*来源[:： ]", self.boxes[i]["text"]):
                     self.boxes.pop(i)
                     continue
+                # 同一 layout 的多个文本框归入同一张表。
                 if lout_no not in tables:
                     tables[lout_no] = []
                 tables[lout_no].append(self.boxes[i])
+                # 被抽出的表格框从正文 boxes 中移除，避免后面又被当普通正文输出。
                 self.boxes.pop(i)
+                # 记录最近一次处理到的布局编号。
                 lst_lout_no = lout_no
                 continue
+            # 只有 need_image=True 时才抽取 figure。
+            # 某些调用方只关心文本，不需要额外返回图片区域。
             if need_image and self.boxes[i]["layout_type"] == "figure":
+                # 图片来源说明同样不作为图片正文描述保留。
                 if re.match(r"(数据|资料|图表)*来源[:： ]", self.boxes[i]["text"]):
                     self.boxes.pop(i)
                     continue
+                # 同一 figure layout 的多个框归到同一张图。
                 if lout_no not in figures:
                     figures[lout_no] = []
                 figures[lout_no].append(self.boxes[i])
+                # 从正文流里移走。
                 self.boxes.pop(i)
                 lst_lout_no = lout_no
                 continue
             i += 1
 
-        # merge table on different pages
+        # 第二步：尝试把跨页表格合并起来。
+        # 很多 PDF 表格会被硬切在分页符两侧，第一页底部半张表、第二页顶部续表。
+        # 如果不在这里合并，后面的 construct_table() 会把它们当成两张独立表。
         nomerge_lout_no = set(nomerge_lout_no)
+        # 按出现顺序排序，便于从后往前比较相邻表格是否属于同一张跨页表。
         tbls = sorted([(k, bxs) for k, bxs in tables.items()], key=lambda x: (x[1][0]["top"], x[1][0]["x0"]))
 
+        # 从后往前看相邻两张表，尝试把后一张并入前一张。
         i = len(tbls) - 1
         while i - 1 >= 0:
             k0, bxs0 = tbls[i - 1]
             k, bxs = tbls[i]
             i -= 1
+            # 如果前一张表附近有 caption/title/reference 等边界信号，就不跨页合并。
             if k0 in nomerge_lout_no:
                 continue
+            # 同页的两张表不是“跨页续表”，不能合并。
             if bxs[0]["page_number"] == bxs0[0]["page_number"]:
                 continue
+            # 相差超过一页通常不可能是同一张表的直接续页。
             if bxs[0]["page_number"] - bxs0[0]["page_number"] > 1:
                 continue
+            # 用后一页的平均行高作为纵向距离尺度。
             mh = self.mean_height[bxs[0]["page_number"] - 1]
+            # 如果前一张表的最后一个框和后一张表的第一个框在累计 Y 坐标上相距过远，
+            # 就认为它们不是同一张表的上下两截。
             if self._y_dis(bxs0[-1], bxs[0]) > mh * 23:
                 continue
+            # 满足条件时，把后一张表的所有框并到前一张表，删除后者。
             tables[k0].extend(tables[k])
             del tables[k]
 
         def x_overlapped(a, b):
+            # 判断两个框在水平方向是否有重叠。
+            # caption 寻找最近 table/figure 时，如果 x 方向已有覆盖，就把横向距离当作 0。
             return not any([a["x1"] < b["x0"], a["x0"] > b["x1"]])
 
-        # find captions and pop out
+        # 第三步：从剩余正文框里查找 caption，并把它们挂到最近的表格或图片上。
+        # caption 之所以单独后处理，是因为 OCR/layout 阶段不一定总能稳定地把 caption 和主体放到同一组里。
         i = 0
         while i < len(self.boxes):
+            # c 是候选 caption 框。
             c = self.boxes[i]
             # mh = self.mean_height[c["page_number"]-1]
+            # 只有被规则识别为 caption 的框才参与下面的最近邻归并。
             if not TableStructureRecognizer.is_caption(c):
                 i += 1
                 continue
 
-            # find the nearest layouts
+            # 在 tables 或 figures 中寻找离当前 caption 最近的那个布局。
+            # 距离定义是 y_dis^2 + x_dis^2：
+            # 纵向距离和横向距离共同决定归属，若 x 方向有重叠则只看纵向距离。
             def nearest(tbls):
                 nonlocal c
                 mink = ""
                 minv = 1000000000
                 for k, bxs in tbls.items():
                     for b in bxs:
+                        # 已经是 caption 的框不作为主体候选，避免 caption 之间互相吸附。
                         if b.get("layout_type", "").find("caption") >= 0:
                             continue
                         y_dis = self._y_dis(c, b)
@@ -1291,30 +1642,41 @@ class RAGFlowPdfParser:
             # if min(tv, fv) > 2000:
             #    i += 1
             #    continue
+            # 如果最近的表比最近的图更近，就把 caption 插到表格内容前面。
+            # insert(0, c) 的意义是让 caption 在后续拼装输出时排在主体前面。
             if tv < fv and tk:
                 tables[tk].insert(0, c)
                 logging.debug("TABLE:" + self.boxes[i]["text"] + "; Cap: " + tk)
+            # 否则如果存在最近的 figure，就挂到图片前面。
             elif fk:
                 figures[fk].insert(0, c)
                 logging.debug("FIGURE:" + self.boxes[i]["text"] + "; Cap: " + tk)
+            # 无论挂给谁，caption 本身都要从正文框里移除。
             self.boxes.pop(i)
 
         def cropout(bxs, ltype, poss):
+            # 根据一组 table/figure 相关框，裁出对应的图像区域。
+            # 这里既支持单页，也支持跨页：跨页时会逐页裁出后再上下拼接成一张长图。
             nonlocal ZM
             max_page_index = len(self.page_images) - 1
 
             def local_page_index(page_number):
+                # 把 box 里的 page_number 映射到 page_images 的局部下标。
+                # page_number 在某些场景下可能是全局页号，而当前 parser 只加载了部分页，
+                # 所以当 page_from > 0 时要尝试做一次偏移修正。
                 idx = page_number - 1 if page_number > 0 else 0
                 if idx > max_page_index and self.page_from:
                     idx = page_number - 1 - self.page_from
                 return idx
 
+            # 先收集这组框分布在哪些页。
             pn = set()
             for b in bxs:
                 idx = local_page_index(b["page_number"])
                 if 0 <= idx <= max_page_index:
                     pn.add(idx)
                 else:
+                    # 某些异常页号无法映射回已加载页图时，只记日志并跳过。
                     logging.warning(
                         "Skip out-of-range page_number %s (page_from=%s, pages=%s)",
                         b.get("page_number"),
@@ -1322,25 +1684,37 @@ class RAGFlowPdfParser:
                         len(self.page_images),
                     )
 
+            # 没有任何有效页可裁，就返回 None。
             if not pn:
                 return None
 
+            # 单页表格/图片的裁图路径。
             if len(pn) < 2:
                 pn = list(pn)[0]
+                # 当前页在累计坐标系里的起始高度。
                 ht = self.page_cum_height[pn]
+                # 用所有框的外接矩形估算 table/figure 的整体范围。
+                # 注意 top/bottom 要减去累计页高，还原到当前页局部坐标。
                 b = {"x0": np.min([b["x0"] for b in bxs]), "top": np.min([b["top"] for b in bxs]) - ht, "x1": np.max([b["x1"] for b in bxs]), "bottom": np.max([b["bottom"] for b in bxs]) - ht}
+                # 如果当前页 layout 里存在更精确的 table/figure 区域，就优先使用 layout 框裁图。
+                # 这样通常比单纯用文本框外接矩形更完整，能保留边线、空白边距等。
                 louts = [layout for layout in self.page_layout[pn] if layout["type"] == ltype]
                 ii = Recognizer.find_overlapped(b, louts, naive=True)
                 if ii is not None:
                     b = louts[ii]
                 else:
+                    # 找不到 layout 匹配时退回到文本框外接矩形，并记日志。
                     logging.warning(f"Missing layout match: {pn + 1},%s" % (bxs[0].get("layoutno", "")))
 
                 left, top, right, bott = b["x0"], b["top"], b["x1"], b["bottom"]
+                # 极端异常情况下 right 可能小于 left，这里强制修正，避免 crop 崩溃。
                 if right < left:
                     right = left + 1
+                # 记录该裁图在原文档中的位置信息，供 need_position=True 的调用方使用。
                 poss.append((pn + self.page_from, left, right, top, bott))
+                # 真正从 page_images 裁图时要乘回 ZM，因为 page_images 是放大后的像素坐标。
                 return self.page_images[pn].crop((left * ZM, top * ZM, right * ZM, bott * ZM))
+            # 多页表格/图片：先按页分桶。
             pn = {}
             for b in bxs:
                 p = local_page_index(b["page_number"])
@@ -1348,11 +1722,15 @@ class RAGFlowPdfParser:
                     if p not in pn:
                         pn[p] = []
                     pn[p].append(b)
+            # 按页号排序，保证拼接顺序从前到后。
             pn = sorted(pn.items(), key=lambda x: x[0])
+            # 对每一页递归调用 cropout，得到每页自己的局部裁图。
             imgs = [cropout(arr, ltype, poss) for p, arr in pn]
             imgs = [img for img in imgs if img is not None]
             if not imgs:
                 return None
+            # 多页时，把各页裁图上下拼成一张长图。
+            # 这样下游无论是展示还是进一步处理，都可以把跨页表/图看成一个整体。
             pic = Image.new("RGB", (int(np.max([i.size[0] for i in imgs])), int(np.sum([m.size[1] for m in imgs]))), (245, 245, 245))
             height = 0
             for img in imgs:
@@ -1360,22 +1738,29 @@ class RAGFlowPdfParser:
                 height += img.size[1]
             return pic
 
+        # res/positions 用于 tables 或“表图混合返回”模式；
+        # figure_results/figure_positions 只在 separate_tables_figures=True 时单独返回 figure。
         res = []
         positions = []
         figure_results = []
         figure_positions = []
-        # crop figure out and add caption
+        # 先处理 figures。
+        # figure 的文本内容通常就是若干说明框 + caption 拼起来的描述文本。
         for k, bxs in figures.items():
+            # 用换行把 figure 相关文本串起来，保留说明文字的层次感。
             txt = "\n".join([b["text"] for b in bxs])
             if not txt:
                 continue
 
             poss = []
 
+            # separate_tables_figures=True 时，figure 和 table 分开返回；
+            # 否则都塞进统一的 res 列表。
             if separate_tables_figures:
                 img = cropout(bxs, "figure", poss)
                 if img is None:
                     continue
+                # figure 的结构化文本这里只是一个字符串列表，不做像表格那样的行列重建。
                 figure_results.append((img, [txt]))
                 figure_positions.append(poss)
             else:
@@ -1385,9 +1770,12 @@ class RAGFlowPdfParser:
                 res.append((img, [txt]))
                 positions.append(poss)
 
+        # 再处理 tables。
         for k, bxs in tables.items():
             if not bxs:
                 continue
+            # 先按 Y 优先排序。
+            # 阈值用平均半行高，是为了同一行内按 X 排、跨行时按 Y 排，更符合表格阅读顺序。
             bxs = Recognizer.sort_Y_firstly(bxs, np.mean([(b["bottom"] - b["top"]) / 2 for b in bxs]))
 
             poss = []
@@ -1395,18 +1783,25 @@ class RAGFlowPdfParser:
             img = cropout(bxs, "table", poss)
             if img is None:
                 continue
+            # 已读 TableStructureRecognizer.construct_table()：
+            # 它会先移出 caption，再根据前面打好的 R/H/C/SP 标签重建行、列、表头、跨行跨列关系，
+            # 最终输出 HTML 或文字描述。
             res.append((img, self.tbl_det.construct_table(bxs, html=return_html, is_english=self.is_english)))
             positions.append(poss)
 
+        # 统一整理返回格式。
         if separate_tables_figures:
+            # 保证“结果数量”和“位置数量”始终一一对应。
             assert len(positions) + len(figure_positions) == len(res) + len(figure_results)
             if need_position:
+                # 返回 ((内容, 位置)) 的形式，tables 和 figures 分开给调用方。
                 return list(zip(res, positions)), list(zip(figure_results, figure_positions))
             else:
                 return res, figure_results
         else:
             assert len(positions) == len(res)
             if need_position:
+                # 混合模式下，返回每个元素及其位置。
                 return list(zip(res, positions))
             else:
                 return res
@@ -1522,36 +1917,75 @@ class RAGFlowPdfParser:
             logging.exception("total_page_number")
 
     def __images__(self, fnm, zoomin=3, page_from=0, page_to=299, callback=None):
+        # lefted_chars 用来存放后续流程里没有被成功并入文本框的残余字符。
+        # 这里先清空，确保每次解析新 PDF 或新页范围时状态是干净的，避免上一次解析的数据串进来。
         self.lefted_chars = []
+        # mean_height 记录每页字符/文本框的平均高度近似值。
+        # 后面的排序、同行判断、文本合并都会依赖这个尺度信息，所以在 OCR 前先为每页准备容器。
         self.mean_height = []
+        # mean_width 记录每页字符的典型宽度。
+        # 它常被拿来做横向间距阈值，尤其在英文/数字间空格恢复时很有用。
         self.mean_width = []
+        # boxes 保存每页最终产出的文本框。
+        # __ocr() 会逐页 append，所以这里必须先重置为空列表。
         self.boxes = []
+        # garbages 用来记录疑似噪声框、乱码框或后续清洗阶段要剔除的内容。
+        # 先初始化为空，便于本次解析单独维护自己的“脏数据”集合。
         self.garbages = {}
+        # page_cum_height 记录页高累计值，初始放一个 0 作为前缀和起点。
+        # 后面布局分析会把“页内坐标”转成“整篇文档累计坐标”，这样跨页排序和定位会更统一。
         self.page_cum_height = [0]
+        # page_layout 保存每页版面识别结果，后续 _layouts_rec() 会填充。
         self.page_layout = []
+        # 记录这次处理从哪一页开始。
+        # 后续日志、页号换算、异常提示都需要保留这个原始页偏移。
         self.page_from = page_from
+        # 记录整个 __images__ 阶段耗时，便于看“读取 PDF + 转图片 + 抽文字层”花了多久。
         start = timer()
         try:
+            # pdfplumber 在一些底层对象上不是完全线程安全的，所以这里通过全局锁串行打开 PDF。
+            # 这是稳定性优先的工程取舍：牺牲一点并发，避免多文档并发时出现诡异崩溃或句柄冲突。
             with sys.modules[LOCK_KEY_pdfplumber]:
+                # fnm 既可能是文件路径，也可能是二进制内容。
+                # 统一在这里兼容两种输入，减少上层调用分支。
                 with pdfplumber.open(fnm) if isinstance(fnm, str) else pdfplumber.open(BytesIO(fnm)) as pdf:
+                    # 保留 pdf 句柄到实例上，方便同一轮解析里别的子流程继续访问页对象和元数据。
                     self.pdf = pdf
+                    # 把目标页范围转成图像。
+                    # resolution=72 * zoomin 表示按 PDF 默认 72 DPI 的倍数放大；
+                    # 放大的原因是 OCR 对小字和细线更敏感，分辨率过低会明显损伤检测召回。
+                    # antialias=True 则是为了减轻锯齿，让字符边界更平滑，通常有利于检测和识别。
                     self.page_images = [p.to_image(resolution=72 * zoomin, antialias=True).annotated for i, p in enumerate(self.pdf.pages[page_from:page_to])]
 
                     try:
+                        # 优先从 PDF 文本层抽取原生字符，而不是一上来就全量 OCR。
+                        # dedupe_chars() 会去掉重复字符，避免同一文字在 PDF 内部被多次绘制造成重复文本。
+                        # 再用 _has_color(c) 过滤，是为了尽量排除不可见字符、装饰字符或异常颜色层带来的噪声。
+                        # 这体现的是“能用文本层就先用文本层”的策略：更快、通常也比 OCR 更准。
                         self.page_chars = [[c for c in page.dedupe_chars().chars if self._has_color(c)] for page in self.pdf.pages[page_from:page_to]]
                     except Exception as e:
+                        # 文本层抽取失败不能让整个 PDF 解析直接中断。
+                        # 因为扫描件、本身编码异常的 PDF、本地解析兼容性问题，都可能让这里失败，
+                        # 但只要页图还在，后面仍然可以退化成纯 OCR 路线完成解析。
                         logging.warning(f"Failed to extract characters for pages {page_from}-{page_to}: {str(e)}")
                         self.page_chars = [[] for _ in range(page_to - page_from)]  # If failed to extract, using empty list instead.
 
-                    # Detect garbled pages and clear their chars so the OCR
-                    # path will be used instead. Two detection strategies:
-                    # 1) PUA / unmapped CID characters (threshold=0.3)
-                    # 2) Font-encoding garbling: subset fonts mapping CJK to ASCII
+                    # 对每页抽出来的文本层做“乱码体检”。
+                    # 一旦判定为乱码，就主动清空这一页的 page_chars，强制后续走 OCR 补救。
+                    # 这里的核心思想是：错误的文本层往往比没有文本层更危险，
+                    # 因为它会让系统误以为“已经抽到了文字”，结果把错误字符带进索引。
+                    # 当前用了两种策略：
+                    # 1) PUA / 未映射 CID 字符比例过高，常见于私有区乱码或字库映射失败；
+                    # 2) 字体编码乱码，例如子集字体把中文错误映射成 ASCII 乱码。
                     for pi, page_ch in enumerate(self.page_chars):
+                        # 空页或没抽到字符的页直接跳过，后续自然会走 OCR。
                         if not page_ch:
                             continue
-                        # Strategy 1: PUA / CID garbling
+                        # 策略 1：先抽样判断是否存在大量私有区字符、CID 残片这类“明显乱码”。
+                        # 只采样前 200 个字符，是准确性和性能的折中；
+                        # 对于乱码页，前面一段通常已经足够暴露问题，没必要整页全扫。
                         sample = page_ch if len(page_ch) <= 200 else page_ch[:200]
+                        # 把字符对象里的 text 拼成一个样本文本，交给 _is_garbled_text() 做比例检测。
                         sample_text = "".join(c.get("text", "") for c in sample)
                         if self._is_garbled_text(sample_text, threshold=0.3):
                             logging.warning(
@@ -1559,9 +1993,12 @@ class RAGFlowPdfParser:
                                 "clearing to use OCR fallback.",
                                 page_from + pi + 1, len(page_ch),
                             )
+                            # 一旦发现文本层大概率不可用，就整页清空，让 __ocr() 不再尝试复用这些字符。
                             self.page_chars[pi] = []
                             continue
-                        # Strategy 2: font-encoding garbling (CJK mapped to ASCII)
+                        # 策略 2：检查是否是字体编码层面的乱码。
+                        # 这类问题不一定表现为私有区字符，而是“看起来像普通 ASCII，
+                        # 但其实应该是中文/日文/韩文被错误映射出来”的情况。
                         if self._is_garbled_by_font_encoding(page_ch):
                             logging.warning(
                                 "Page %d: detected font-encoding garbled text "
@@ -1569,25 +2006,42 @@ class RAGFlowPdfParser:
                                 "clearing to use OCR fallback.",
                                 page_from + pi + 1, len(page_ch),
                             )
+                            # 同样直接清空该页原生字符，避免后续把错误文本并入 OCR 框。
                             self.page_chars[pi] = []
 
+                    # total_page 记录整个 PDF 的总页数，不受 page_from/page_to 裁剪影响。
+                    # 后续 UI 回调、页号展示和其它分页逻辑会用到这个全局页数。
                     self.total_page = len(self.pdf.pages)
 
         except Exception as e:
+            # 这里兜底整个“打开 PDF + 转图片 + 抽文本层”的大流程异常。
+            # 记录完整堆栈，方便定位是 PDF 损坏、渲染失败还是字符抽取失败。
             logging.exception(f"RAGFlowPdfParser __images__, exception: {e}")
+        # 输出到这里为止的总耗时，覆盖文本层抽取和页图准备阶段。
         logging.info(f"__images__ dedupe_chars cost {timer() - start}s")
 
+        # 说明页图已经准备完毕，后续可以正式进入 OCR。
         logging.debug("Images converted.")
+        # 用抽样字符粗判整份 PDF 是否以英文为主。
+        # 这里不是语言识别模型，而是一个轻量启发式判断：如果长串里英文/数字/英文标点占优，
+        # 就把文档视作英文文档。
+        # 这样做的原因是英文 PDF 往往更依赖空格和原生文本层，而中文扫描件更常直接走 OCR 补救。
         self.is_english = [
             re.search(r"[ a-zA-Z0-9,/¸;:'\[\]\(\)!@#$%^&*\"?<>._-]{30,}", "".join(random.choices([c["text"] for c in self.page_chars[i]], k=min(100, len(self.page_chars[i])))))
             for i in range(len(self.page_chars))
         ]
+        # 如果超过半数页面都像英文页，就把整份文档标成英文。
+        # 用“多数页投票”而不是“任意一页命中”，是为了降低目录页、封面页、表格页带来的误判。
         if sum([1 if e else 0 for e in self.is_english]) > len(self.page_images) / 2:
             self.is_english = True
         else:
             self.is_english = False
 
         async def __img_ocr(i, id, img, chars, limiter):
+            # 在进入 __ocr() 前，先尝试恢复英文/数字之间可能丢失的空格。
+            # PDF 文本层经常把相邻英文字符拆成独立字符对象，却不保留视觉上的空白。
+            # 如果两个相邻字符都是拉丁文本，且间距足够大，就手动补一个空格，
+            # 这样后面合并文本时更接近人眼看到的原始单词边界。
             j = 0
             while j + 1 < len(chars):
                 if (
@@ -1599,29 +2053,49 @@ class RAGFlowPdfParser:
                     chars[j]["text"] += " "
                 j += 1
 
+            # 如果配置了并发限制器，就用 semaphore 控制同时跑 OCR 的页数。
+            # 这样做是为了在多 GPU / 多 worker 场景下避免瞬时把显存、CPU 线程、IO 一起打满。
             if limiter:
                 async with limiter:
                     await thread_pool_exec(self.__ocr, i + 1, img, chars, zoomin, id)
             else:
+                # 没有限流器时直接同步调用当前页的 __ocr()。
                 self.__ocr(i + 1, img, chars, zoomin, id)
 
+            # 每处理完 6 页回调一次进度。
+            # 不按每页都回调，是为了减少 UI 更新过于频繁带来的额外开销。
             if callback and i % 6 == 5:
                 callback((i + 1) * 0.6 / len(self.page_images))
 
         async def __img_ocr_launcher():
             def __ocr_preprocess():
+                # 如果整份文档被判定为英文，这里故意不把 page_chars 传给 __ocr()。
+                # 这是一个策略性取舍：英文 PDF 文本层常常存在粘连、断词、编码不稳等问题，
+                # 某些情况下直接让 OCR 主导会更一致；而非英文文档更值得优先复用文本层。
                 chars = self.page_chars[i] if not self.is_english else []
+                # 用当前页字符高度的中位数估计“典型行高”。
+                # 选中位数而不是均值，是因为它对特别大的标题字、小角标这类异常值更稳。
                 self.mean_height.append(np.median(sorted([c["height"] for c in chars])) if chars else 0)
+                # 同理估计典型字符宽度；如果当前页没有字符，就先给一个经验默认值 8。
+                # 这个值不是绝对精确，只是给后续距离阈值一个保底尺度。
                 self.mean_width.append(np.median(sorted([c["width"] for c in chars])) if chars else 8)
+                # 记录当前页在 PDF 逻辑坐标里的高度。
+                # 注意这里要除以 zoomin，因为 img.size 是放大后的像素尺寸，
+                # 而后续版面框坐标希望统一回到 PDF 逻辑尺度。
                 self.page_cum_height.append(img.size[1] / zoomin)
                 return chars
 
             if self.parallel_limiter:
+                # 有并行限制器时，说明当前环境允许多设备/多任务并行 OCR。
+                # 这里先收集所有页任务，再统一 await，提高整体吞吐。
                 tasks = []
 
                 for i, img in enumerate(self.page_images):
+                    # 先做当前页 OCR 前的统计准备，避免在真正启动任务后再修改共享状态。
                     chars = __ocr_preprocess()
 
+                    # 通过取模把页面均匀分发到多个设备槽位上。
+                    # 这不是严格调度器，但实现简单，通常足以把多页任务摊平到多个 GPU。
                     semaphore = self.parallel_limiter[i % settings.PARALLEL_DEVICES]
 
                     async def wrapper(i=i, img=img, chars=chars, semaphore=semaphore):
@@ -1633,37 +2107,59 @@ class RAGFlowPdfParser:
                             semaphore,
                         )
 
+                    # 把每页 OCR 包成独立异步任务，后面统一并发执行。
                     tasks.append(asyncio.create_task(wrapper()))
+                    # 主动让出一次事件循环，避免单次 for 循环长时间霸占调度。
                     await asyncio.sleep(0)
 
                 try:
+                    # 等待所有页 OCR 完成；一旦其中一个抛错，直接进入异常分支统一收尾。
                     await asyncio.gather(*tasks, return_exceptions=False)
                 except Exception as e:
+                    # 某页 OCR 失败时，记录错误并取消所有未完成任务。
+                    # 这样可以避免部分任务继续跑，造成状态半成功半失败、难以推断。
                     logging.error(f"Error in OCR: {e}")
                     for t in tasks:
                         t.cancel()
+                    # 再次 gather 是为了把取消后的任务都清理干净，避免悬空协程。
                     await asyncio.gather(*tasks, return_exceptions=True)
                     raise
 
             else:
+                # 没开启多设备并发时，按页顺序串行执行 OCR。
+                # 这样最简单，也更容易复现和排查问题。
                 for i, img in enumerate(self.page_images):
                     chars = __ocr_preprocess()
                     await __img_ocr(i, 0, img, chars, None)
 
+        # 从这一刻开始计时纯 OCR 阶段，不再和前面的 PDF 读取/转图混在一起。
         start = timer()
 
+        # 启动整份文档的逐页 OCR 调度器。
         asyncio.run(__img_ocr_launcher())
 
+        # 记录 OCR 阶段耗时，方便区分瓶颈是在“取页图”还是“识别文本”。
         logging.info(f"__images__ {len(self.page_images)} pages cost {timer() - start}s")
 
+        # 如果前面没能从文本层判断语言，而且 page_chars 基本为空，
+        # 就退化成从 OCR 结果里再猜一次是否为英文文档。
+        # 这样能覆盖扫描件 PDF：它没有文本层，只能依赖识别后的文字来判断语言倾向。
         if not self.is_english and not any([c for c in self.page_chars]) and self.boxes:
             bxes = [b for bxs in self.boxes for b in bxs]
             self.is_english = re.search(r"[ \na-zA-Z0-9,/¸;:'\[\]\(\)!@#$%^&*\"?<>._-]{30,}", "".join([b["text"] for b in random.choices(bxes, k=min(30, len(bxes)))]))
 
+        # 打印最终的英文判定结果，方便观察策略是否生效。
         logging.debug(f"Is it English: {self.is_english}")
 
+        # 把逐页高度列表转成前缀和。
+        # 后面只要知道 box 在第几页，就能 O(1) 算出它映射到整篇文档后的累计 Y 坐标。
         self.page_cum_height = np.cumsum(self.page_cum_height)
+        # page_cum_height 应该总是比 page_images 多一个前缀 0。
         assert len(self.page_cum_height) == len(self.page_images) + 1
+        # 如果一个框都没识别出来，并且当前分辨率还不算太高，就自动放大 3 倍重试。
+        # 这是典型的召回优先兜底策略：有些细小文字在低分辨率下完全检不出，
+        # 提高渲染分辨率后检测器往往能恢复。
+        # 上限 zoomin < 9 是为了防止无节制放大导致内存和耗时爆炸。
         if len(self.boxes) == 0 and zoomin < 9:
             self.__images__(fnm, zoomin * 3, page_from, page_to, callback)
 
